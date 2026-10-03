@@ -34,6 +34,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+# setup-beam cannot detect the OS on self-hosted runners
+env:
+  ImageOS: ubuntu22
+
 jobs:
   versions:
     name: Get versions
