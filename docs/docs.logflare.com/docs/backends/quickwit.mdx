@@ -37,6 +37,7 @@ The following is supported:
 - `SELECT` of fields or `*` from one source, with `WHERE`, `ORDER BY` a field, `LIMIT` (at most 1000 rows) and `OFFSET`.
 - CTEs that select from a source or from another CTE. The `WHERE` clauses of all levels are combined.
 - `CROSS JOIN UNNEST(metadata) AS m`. Nested fields are plain document paths in Quickwit, so `m.request.path` reads `metadata.request.path`. Unlike in BigQuery, the join does not drop events that lack the unnested field.
+- A column written without a prefix that is not an event column (`timestamp`, `id`, `event_message`, `metadata`, `project`, `identifier`) is read from an unnested record: `request` or `response` for their usual fields (`path`, `method`, `status_code`, ...), otherwise the outermost one.
 - Conditions: `AND`, `OR`, `NOT`, `=`, `!=`, `<`, `<=`, `>`, `>=`, `IN`, `BETWEEN`, `IS [NOT] NULL`, `LIKE`, `regexp_contains`, `contains`, `starts_with`, boolean `CASE`, and `IFNULL`, `COALESCE`, `CAST` and `SAFE_CAST` around a field.
 - Aggregates: `count(*)`, `count(field)`, `count(DISTINCT field)`, `countif(<condition>)`, `count(CASE WHEN <condition> THEN 1 END)`, `sum`, `avg`, `min` and `max` of a field.
 - `GROUP BY` one or more fields, optionally with one time bucket: `timestamp_trunc(timestamp, minute)` with `second`, `minute`, `hour`, `day` or `week`. `ORDER BY` and `LIMIT` apply to the grouped rows.
