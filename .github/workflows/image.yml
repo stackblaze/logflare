@@ -1,0 +1,49 @@
+name: Build logflare image
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+concurrency:
+  group: logflare-image-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: [self-hosted, us-east-1]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Image tag
+        id: ver
+        run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ghcr.io/stackblaze/logflare:latest
+            ghcr.io/stackblaze/logflare:sha-${{ steps.ver.outputs.short }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/stackblaze/logflare
+          build-args: |
+            COMMIT_SHA=${{ steps.ver.outputs.short }}
