@@ -86,8 +86,27 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor.Query do
               counters: [{String.t(), es_query()}],
               size: pos_integer()
             }
+          | %{
+              shape: :aggregate,
+              query: es_query(),
+              keys: [{String.t() | nil, key()}],
+              metrics: [
+                {String.t(), :count | :distinct | :sum | :avg | :min | :max, String.t() | nil,
+                 es_query()}
+              ],
+              columns: [{String.t(), expression()}],
+              order: [{String.t(), :asc | :desc}],
+              limit: pos_integer(),
+              size: pos_integer()
+            }
 
   @type column :: {:path, [String.t()]} | {:datetime, [String.t()]}
+  @type key :: {:bucket, String.t(), :micros | :datetime} | {:term, String.t()}
+  @type expression ::
+          {:key, non_neg_integer()}
+          | {:metric, String.t()}
+          | {:const, term()}
+          | {:call, atom(), [expression()]}
 
   @spec source_field() :: String.t()
   def source_field, do: @source_field
@@ -242,7 +261,23 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor.Query do
 
   ## Result shape
 
+  # The simple shapes cover Studio's Logs pages with one search each. Anything else that
+  # aggregates (several GROUP BY columns, avg/sum/min/max, computed columns) becomes the
+  # general `:aggregate` shape.
   defp classify(query, select, base, ctx) do
+    classify_simple(query, select, base, ctx)
+  catch
+    {:unsupported, _message} = reason ->
+      if aggregate?(select), do: aggregate(query, select, base, ctx), else: throw(reason)
+  else
+    {:error, _message} = error ->
+      if aggregate?(select), do: aggregate(query, select, base, ctx), else: error
+
+    plan ->
+      plan
+  end
+
+  defp classify_simple(query, select, base, ctx) do
     items = Enum.map(select["projection"] || [], &projection_item(&1, ctx))
     group_by = group_by(select, ctx)
     aggregates = for {:count, name, filter} <- items, do: {name, all_of([base, filter])}
@@ -327,6 +362,8 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor.Query do
 
   defp count_filter([expr], ctx) do
     case operand(expr, ctx) do
+      # every event has an id; it is not a fast field, so `exists` cannot see it
+      {:field, ["id"], _default, _cast} -> true
       {:field, path, :none, _cast} -> exists(path)
       {:field, _path, _default, _cast} -> true
       _ -> unsupported("Unsupported count() argument")
@@ -445,6 +482,226 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor.Query do
          sort: sort(query, items, ctx),
          columns: columns
        }}
+    end
+  end
+
+  ## General aggregation
+
+  @aggregate_functions ~w(count countif sum avg min max)
+  @metric_functions %{"sum" => :sum, "avg" => :avg, "min" => :min, "max" => :max}
+  @arithmetic %{
+    "Divide" => :divide,
+    "Multiply" => :multiply,
+    "Plus" => :add,
+    "Minus" => :subtract
+  }
+  @scalar_functions %{
+    "round" => :round,
+    "coalesce" => :coalesce,
+    "ifnull" => :coalesce,
+    "safe_divide" => :divide
+  }
+
+  defp aggregate?(select) do
+    group_by(select, nil) != [] or Enum.any?(select["projection"] || [], &aggregate_expr?/1)
+  end
+
+  defp aggregate_expr?(%{"Function" => function} = expr) do
+    function_name(function) in @aggregate_functions or
+      Enum.any?(expr, fn {_key, value} -> aggregate_expr?(value) end)
+  end
+
+  defp aggregate_expr?(%{} = expr),
+    do: Enum.any?(expr, fn {_key, value} -> aggregate_expr?(value) end)
+
+  defp aggregate_expr?(list) when is_list(list), do: Enum.any?(list, &aggregate_expr?/1)
+  defp aggregate_expr?(_), do: false
+
+  defp aggregate(query, select, base, ctx) do
+    {items, metrics} =
+      Enum.map_reduce(select["projection"] || [], [], fn item, metrics ->
+        {expr, name} = aliased(item)
+        {compiled, metrics} = aggregate_expr(expr, ctx, metrics)
+        {{name || default_name(expr, compiled), compiled}, metrics}
+      end)
+
+    keys = Enum.map(group_by(select, ctx), &group_key(&1, items, ctx))
+    key_values = Enum.map(keys, fn {_name, key} -> key end)
+
+    for {name, {:key, key}} <- items, key not in key_values do
+      unsupported("Column #{name} must appear in GROUP BY or be aggregated")
+    end
+
+    {buckets, terms} = Enum.split_with(keys, &match?({_name, {:bucket, _, _}}, &1))
+    if length(buckets) > 1, do: unsupported("Only one time bucket per query is supported")
+
+    {:ok,
+     %{
+       shape: :aggregate,
+       query: to_query(base),
+       keys: buckets ++ terms,
+       metrics:
+         for {id, kind, field, filter} <- Enum.reverse(metrics) do
+           {id, kind, field, to_query(all_of([base, filter]))}
+         end,
+       columns: for({name, compiled} <- items, do: {name, column_expr(compiled, keys)}),
+       order: aggregate_order(query, items),
+       limit: min(limit(query) || @max_limit, @max_limit),
+       size: @terms_size
+     }}
+  end
+
+  defp aliased(%{"UnnamedExpr" => expr}), do: {expr, nil}
+
+  defp aliased(%{"ExprWithAlias" => %{"expr" => expr, "alias" => %{"value" => name}}}),
+    do: {expr, name}
+
+  defp aliased(_), do: unsupported("SELECT * cannot be combined with aggregates")
+
+  defp default_name(_expr, {:key, {:term, field}}), do: field |> String.split(".") |> List.last()
+  defp default_name(_expr, {:key, {:bucket, _, _}}), do: @timestamp_field
+  defp default_name(%{"Function" => function}, _compiled), do: function_name(function)
+  defp default_name(_expr, _compiled), do: "f0_"
+
+  # Keys become references by position among the plan's keys, so the adaptor can read them
+  # from a bucket path.
+  defp column_expr({:key, key}, keys),
+    do: {:key, Enum.find_index(keys, fn {_name, k} -> k == key end)}
+
+  defp column_expr({:call, fun, args}, keys),
+    do: {:call, fun, Enum.map(args, &column_expr(&1, keys))}
+
+  defp column_expr(other, _keys), do: other
+
+  # Compiles a SELECT expression into `{:key, key} | {:metric, id} | {:const, value} |
+  # {:call, fun, args}`, collecting the metrics it needs.
+  defp aggregate_expr(%{"Nested" => expr}, ctx, metrics), do: aggregate_expr(expr, ctx, metrics)
+
+  defp aggregate_expr(%{"Cast" => %{"expr" => expr, "data_type" => type}} = cast, ctx, metrics) do
+    if aggregate_expr?(expr) or bucket_expr?(expr) do
+      {compiled, metrics} = aggregate_expr(expr, ctx, metrics)
+      {cast_bucket(compiled, cast_kind(type)), metrics}
+    else
+      aggregate_operand(cast, ctx, metrics)
+    end
+  end
+
+  defp aggregate_expr(%{"BinaryOp" => %{"left" => left, "op" => op, "right" => right}}, ctx, m)
+       when is_map_key(@arithmetic, op) do
+    {left, m} = aggregate_expr(left, ctx, m)
+    {right, m} = aggregate_expr(right, ctx, m)
+    {{:call, @arithmetic[op], [left, right]}, m}
+  end
+
+  defp aggregate_expr(%{"Function" => function} = expr, ctx, metrics) do
+    name = function_name(function)
+    args = function_args(function)
+
+    cond do
+      name == "count" and distinct?(function) ->
+        metric(:distinct, field_name!(args, ctx), true, metrics)
+
+      name == "count" ->
+        metric(:count, nil, count_filter(args, ctx), metrics)
+
+      name == "countif" ->
+        metric(:count, nil, condition(single!(args, name), ctx), metrics)
+
+      is_map_key(@metric_functions, name) ->
+        metric(@metric_functions[name], field_name!(args, ctx), true, metrics)
+
+      bucket_expr?(expr) ->
+        {:bucket, _name, path, interval} = projection_expr(expr, nil, ctx)
+        if path != [@timestamp_field], do: unsupported("Time buckets need the timestamp field")
+        {{:key, {:bucket, interval, :micros}}, metrics}
+
+      is_map_key(@scalar_functions, name) and aggregate_expr?(expr) ->
+        {args, metrics} = Enum.map_reduce(args, metrics, &aggregate_expr(&1, ctx, &2))
+        {{:call, @scalar_functions[name], args}, metrics}
+
+      true ->
+        aggregate_operand(expr, ctx, metrics)
+    end
+  end
+
+  defp aggregate_expr(expr, ctx, metrics), do: aggregate_operand(expr, ctx, metrics)
+
+  defp cast_bucket({:key, {:bucket, interval, _format}}, :datetime),
+    do: {:key, {:bucket, interval, :datetime}}
+
+  defp cast_bucket(compiled, _kind), do: compiled
+
+  defp aggregate_operand(expr, ctx, metrics) do
+    case operand(expr, ctx) do
+      {:field, path, _default, _cast} -> {{:key, {:term, Enum.join(path, ".")}}, metrics}
+      {:value, value} -> {{:const, value}, metrics}
+    end
+  end
+
+  defp bucket_expr?(%{"Function" => function}),
+    do: function_name(function) in ~w(timestamp_trunc datetime_trunc date_trunc)
+
+  defp bucket_expr?(_), do: false
+
+  defp distinct?(%{"args" => %{"List" => %{"duplicate_treatment" => "Distinct"}}}), do: true
+  defp distinct?(_), do: false
+
+  defp single!([arg], _name), do: arg
+  defp single!(_args, name), do: unsupported("#{name}() takes one argument")
+
+  defp field_name!(args, ctx) do
+    case args do
+      [arg] -> arg |> field_path!(ctx) |> Enum.join(".")
+      _ -> unsupported("Aggregates take one field")
+    end
+  end
+
+  defp metric(kind, field, filter, metrics) do
+    id = "m#{length(metrics)}"
+    {{:metric, id}, [{id, kind, field, filter} | metrics]}
+  end
+
+  # GROUP BY names a SELECT item by position or alias, or a field directly.
+  defp group_key(%{"Value" => %{"value" => %{"Number" => [position, _]}}}, items, _ctx) do
+    case Enum.at(items, String.to_integer(position) - 1) do
+      {name, {:key, key}} -> {name, key}
+      _ -> unsupported("GROUP BY #{position} does not name a groupable column")
+    end
+  end
+
+  defp group_key(expr, items, ctx) do
+    by_alias =
+      case identifier(expr) do
+        [name] -> Enum.find(items, &match?({^name, {:key, _}}, &1))
+        _ -> nil
+      end
+
+    case by_alias do
+      {name, {:key, key}} ->
+        {name, key}
+
+      nil ->
+        {{:key, key}, _metrics} = aggregate_expr(expr, ctx, [])
+        {name, _} = Enum.find(items, {nil, nil}, &match?({_, {:key, ^key}}, &1))
+        {name, key}
+    end
+  end
+
+  defp aggregate_order(query, items) do
+    names = Enum.map(items, fn {name, _compiled} -> name end)
+
+    for %{"expr" => expr} = order <- order_exprs(query),
+        name = order_name(expr, names),
+        do: {name, direction(order)}
+  end
+
+  defp order_name(%{"Value" => %{"value" => %{"Number" => [position, _]}}}, names),
+    do: Enum.at(names, String.to_integer(position) - 1)
+
+  defp order_name(expr, names) do
+    case identifier(expr) do
+      nil -> nil
+      segments -> Enum.find(names, &(&1 == List.last(segments)))
     end
   end
 
@@ -714,6 +971,15 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor.Query do
 
   defp operand(%{"Function" => function}, ctx) do
     case {function_name(function), function_args(function)} do
+      # Structured log lines are stored parsed under `metadata`, so a JSON path into the
+      # message is the same path into `metadata`.
+      {name, [message, %{"Value" => %{"value" => path}}]}
+      when name in ["json_value", "json_extract_scalar"] ->
+        if List.last(field_path!(message, ctx)) not in @text_fields,
+          do: unsupported("#{name}() is only supported on #{Enum.join(@text_fields, ", ")}")
+
+        {:field, ["metadata" | json_path!(literal(path, ctx))], :none, nil}
+
       {name, [first, fallback]} when name in ["ifnull", "coalesce", "nvl"] ->
         case {operand(first, ctx), operand(fallback, ctx)} do
           {{:field, path, :none, cast}, {:value, default}} ->
@@ -743,6 +1009,9 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor.Query do
       segments -> {:field, resolve(segments, ctx.scope), :none, nil}
     end
   end
+
+  defp json_path!("$." <> path) when path != "", do: String.split(path, ".")
+  defp json_path!(path), do: unsupported("Unsupported JSON path #{inspect(path)}")
 
   defp field_path!(expr, ctx) do
     case operand(expr, ctx) do
@@ -937,9 +1206,14 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor.Query do
       String.ends_with?(pattern, "%") and not String.starts_with?(pattern, "%") ->
         prefix(field, core)
 
+      # Exact-match fields cannot be searched for a substring. `%x%` matches values that
+      # start with x, optionally after a leading slash, which covers filtering by path.
+      String.starts_with?(pattern, "%") and String.ends_with?(pattern, "%") ->
+        any_of([prefix(field, core), prefix(field, "/" <> String.trim_leading(core, "/"))])
+
       true ->
         unsupported(
-          "LIKE with a leading wildcard is only supported on #{Enum.join(@text_fields, ", ")}"
+          "LIKE with only a leading wildcard is only supported on #{Enum.join(@text_fields, ", ")}"
         )
     end
   end

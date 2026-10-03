@@ -273,6 +273,133 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor do
     end
   end
 
+  # One search per distinct filter, each with the same nested bucket aggregations. The base
+  # query decides which groups exist; filtered metrics default to 0 (counts) or null.
+  defp run(%{shape: :aggregate} = plan, config) do
+    queries = Enum.uniq([plan.query | Enum.map(plan.metrics, fn {_, _, _, query} -> query end)])
+
+    with {:ok, results} <-
+           each_query(Enum.map(queries, &{nil, &1}), config, &aggregate_body(plan, &1)) do
+      groups = Map.new(queries, fn query -> {query, groups(results[query], plan.keys)} end)
+
+      rows = for {key, _base} <- groups[plan.query], do: aggregate_row(plan, groups, key)
+
+      {:ok, rows |> order_rows(plan.order) |> Enum.take(plan.limit)}
+    end
+  end
+
+  defp aggregate_row(plan, groups, key) do
+    values = Map.new(plan.metrics, &metric_value(&1, groups, key))
+    Map.new(plan.columns, fn {name, expr} -> {name, evaluate(expr, key, values, plan.keys)} end)
+  end
+
+  defp aggregate_body(plan, query) do
+    leaves =
+      for {id, kind, field, ^query} <- plan.metrics, kind != :count, into: %{} do
+        {id, metric_aggregation(kind, field, plan.size)}
+      end
+
+    aggregations =
+      plan.keys
+      |> Enum.with_index()
+      |> Enum.reverse()
+      |> Enum.reduce(leaves, fn {{_name, key}, index}, inner ->
+        bucket = key_aggregation(key, plan.size)
+        bucket = if inner == %{}, do: bucket, else: Map.put(bucket, :aggs, inner)
+        %{"k#{index}" => bucket}
+      end)
+
+    body = %{query: query, size: 0, track_total_hits: true}
+    if aggregations == %{}, do: body, else: Map.put(body, :aggs, aggregations)
+  end
+
+  defp key_aggregation({:bucket, interval, _format}, _size),
+    do: %{date_histogram: %{field: "timestamp", fixed_interval: interval}}
+
+  defp key_aggregation({:term, field}, size), do: %{terms: %{field: field, size: size}}
+
+  # Quickwit has no cardinality aggregation: distinct values are counted as term buckets.
+  defp metric_aggregation(:distinct, field, size), do: %{terms: %{field: field, size: size}}
+  defp metric_aggregation(kind, field, _size), do: %{kind => %{field: field}}
+
+  # Flattens nested buckets into `%{[key values] => leaf}`; empty buckets are not groups.
+  @spec groups(map(), [term()]) :: %{[term()] => map()}
+  defp groups(response, []) do
+    count = get_in(response, ["hits", "total", "value"]) || 0
+    %{[] => Map.put(response["aggregations"] || %{}, "doc_count", count)}
+  end
+
+  defp groups(response, keys), do: flatten(response["aggregations"] || %{}, 0, length(keys), [])
+
+  defp flatten(leaf, depth, depth, path), do: %{Enum.reverse(path) => leaf}
+
+  defp flatten(node, index, depth, path) do
+    for %{"key" => key, "doc_count" => count} = bucket <-
+          get_in(node, ["k#{index}", "buckets"]) || [],
+        count > 0,
+        reduce: %{} do
+      acc -> Map.merge(acc, flatten(bucket, index + 1, depth, [key | path]))
+    end
+  end
+
+  defp metric_value({id, :count, _field, query}, groups, key),
+    do: {id, get_in(groups, [query, key, "doc_count"]) || 0}
+
+  defp metric_value({id, :distinct, _field, query}, groups, key),
+    do: {id, length(get_in(groups, [query, key, id, "buckets"]) || [])}
+
+  defp metric_value({id, _kind, _field, query}, groups, key),
+    do: {id, get_in(groups, [query, key, id, "value"])}
+
+  defp evaluate({:metric, id}, _key, values, _keys), do: values[id]
+  defp evaluate({:const, value}, _key, _values, _keys), do: value
+
+  defp evaluate({:key, index}, key, _values, keys) do
+    {_name, kind} = Enum.at(keys, index)
+    key_value(kind, Enum.at(key, index))
+  end
+
+  defp evaluate({:call, fun, args}, key, values, keys),
+    do: call(fun, Enum.map(args, &evaluate(&1, key, values, keys)))
+
+  defp key_value({:bucket, _interval, :datetime}, millis),
+    do: (trunc(millis) * 1_000) |> to_datetime() |> String.trim_trailing("Z")
+
+  defp key_value({:bucket, _interval, _format}, millis), do: trunc(millis) * 1_000
+  # numeric terms come back as floats
+  defp key_value({:term, _field}, value) when is_float(value) do
+    whole = trunc(value)
+    if whole == value, do: whole, else: value
+  end
+
+  defp key_value({:term, _field}, value), do: value
+
+  defp call(:coalesce, values), do: Enum.find(values, &(not is_nil(&1)))
+  defp call(:round, [value]) when is_number(value), do: round(value)
+
+  defp call(:round, [value, digits]) when is_float(value) and is_integer(digits),
+    do: Float.round(value, digits)
+
+  defp call(:round, [value | _]), do: value
+  defp call(:divide, [a, b]) when is_number(a) and is_number(b) and b != 0, do: a / b
+  defp call(:multiply, [a, b]) when is_number(a) and is_number(b), do: a * b
+  defp call(:add, [a, b]) when is_number(a) and is_number(b), do: a + b
+  defp call(:subtract, [a, b]) when is_number(a) and is_number(b), do: a - b
+  defp call(_fun, _values), do: nil
+
+  defp order_rows(rows, []), do: rows
+  defp order_rows(rows, order), do: Enum.sort(rows, &ordered?(&1, &2, order))
+
+  defp ordered?(_a, _b, []), do: true
+
+  defp ordered?(a, b, [{name, direction} | rest]) do
+    case {a[name], b[name]} do
+      {same, same} -> ordered?(a, b, rest)
+      {x, y} when direction == :asc -> x <= y
+      {x, y} -> x >= y
+    end
+  end
+
   defp aggregate(counters, config, aggregation) do
     each_query(counters, config, &%{query: &1, size: 0, aggs: aggregation})
   end

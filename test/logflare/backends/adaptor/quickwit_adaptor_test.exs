@@ -363,14 +363,79 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptorTest do
              ]
     end
 
+    test "runs grouped aggregates as nested bucket aggregations", ctx do
+      mock_adapter(fn env ->
+        body = Jason.decode!(env.body)
+
+        assert %{
+                 "k0" => %{
+                   "date_histogram" => %{"fixed_interval" => "1h"},
+                   "aggs" => %{"k1" => %{"terms" => %{"field" => "metadata.method"}} = inner}
+                 }
+               } = body["aggs"]
+
+        filtered? = match?(%{"bool" => %{"must" => [_, %{"range" => _}]}}, body["query"])
+        if not filtered?, do: assert(%{"aggs" => %{"m2" => %{"avg" => _}}} = inner)
+
+        method = fn key, count, avg ->
+          %{"key" => key, "doc_count" => count, "m2" => %{"value" => avg}}
+        end
+
+        methods =
+          if filtered?,
+            do: [method.("GET", 1, nil)],
+            else: [method.("GET", 4, 1500.0), method.("POST", 2, nil)]
+
+        buckets = [
+          %{"key" => 1_790_000_000_000.0, "doc_count" => 6, "k1" => %{"buckets" => methods}},
+          %{"key" => 1_790_003_600_000.0, "doc_count" => 0, "k1" => %{"buckets" => []}}
+        ]
+
+        {:ok,
+         %Tesla.Env{status: 200, body: %{"aggregations" => %{"k0" => %{"buckets" => buckets}}}}}
+      end)
+
+      sql = """
+      SELECT cast(timestamp_trunc(t.timestamp, hour) AS datetime) AS timestamp, m.method AS method,
+             count(*) AS count, countif(m.status >= 500) AS errors, round(avg(m.duration) / 1000, 1) AS avg_s
+      FROM #{ctx.table} t CROSS JOIN UNNEST(t.metadata) AS m
+      GROUP BY timestamp, method
+      ORDER BY count DESC
+      """
+
+      assert {:ok, %QueryResult{rows: rows}} =
+               @subject.execute_query(ctx.backend, {sql, [], %{}}, [])
+
+      assert rows == [
+               %{
+                 "timestamp" => "2026-09-21T14:13:20.000000",
+                 "method" => "GET",
+                 "count" => 4,
+                 "errors" => 1,
+                 "avg_s" => 1.5
+               },
+               %{
+                 "timestamp" => "2026-09-21T14:13:20.000000",
+                 "method" => "POST",
+                 "count" => 2,
+                 "errors" => 0,
+                 "avg_s" => nil
+               }
+             ]
+    end
+
     test "returns invalid_query error for unsupported SQL", ctx do
       reject(HttpBased.Client, :new, 1)
 
       assert {:error,
               %QueryError{kind: :invalid_query, backend: @subject, description: description}} =
-               @subject.execute_query(ctx.backend, "SELECT sum(status) FROM #{ctx.table}", [])
+               @subject.execute_query(
+                 ctx.backend,
+                 "SELECT row_number() OVER () FROM #{ctx.table}",
+                 []
+               )
 
-      assert description =~ "sum()"
+      assert description =~ "Unsupported"
     end
 
     test "returns backend_error on a failed search", ctx do

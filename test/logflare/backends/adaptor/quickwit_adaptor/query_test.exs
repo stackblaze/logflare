@@ -227,11 +227,91 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor.QueryTest do
     end
   end
 
+  describe "general aggregation" do
+    test "groups by several columns with metrics and computed columns" do
+      plan =
+        plan!("""
+        SELECT r.path AS path, r.method AS method, count(t.id) AS count,
+               round(avg(m.duration) / 1000, 2) AS avg_ms
+        FROM #{@table} t CROSS JOIN UNNEST(t.metadata) AS m CROSS JOIN UNNEST(m.request) AS r
+        GROUP BY r.path, r.method
+        ORDER BY count DESC
+        LIMIT 10
+        """)
+
+      assert %{shape: :aggregate, query: @source, limit: 10, order: [{"count", :desc}]} = plan
+
+      assert plan.keys == [
+               {"path", {:term, "metadata.request.path"}},
+               {"method", {:term, "metadata.request.method"}}
+             ]
+
+      assert plan.metrics == [
+               {"m0", :count, nil, @source},
+               {"m1", :avg, "metadata.duration", @source}
+             ]
+
+      assert plan.columns == [
+               {"path", {:key, 0}},
+               {"method", {:key, 1}},
+               {"count", {:metric, "m0"}},
+               {"avg_ms",
+                {:call, :round,
+                 [{:call, :divide, [{:metric, "m1"}, {:const, 1000}]}, {:const, 2}]}}
+             ]
+    end
+
+    test "time buckets combine with other keys, countif and count distinct" do
+      plan =
+        plan!("""
+        SELECT cast(timestamp_trunc(timestamp, hour) AS datetime) AS timestamp, level,
+               countif(status >= 500) AS errors, count(DISTINCT user_id) AS users
+        FROM #{@table}
+        GROUP BY timestamp, level
+        """)
+
+      assert plan.keys == [
+               {"timestamp", {:bucket, "1h", :datetime}},
+               {"level", {:term, "level"}}
+             ]
+
+      assert [{"m0", :count, nil, errors}, {"m1", :distinct, "user_id", @source}] = plan.metrics
+
+      assert errors == %{
+               "bool" => %{"must" => [@source, %{"range" => %{"status" => %{"gte" => 500}}}]}
+             }
+    end
+
+    test "aggregates without GROUP BY" do
+      assert %{shape: :aggregate, keys: [], columns: [{"slowest", {:metric, "m0"}}]} =
+               plan!("SELECT max(duration) AS slowest FROM #{@table}")
+    end
+
+    test "json_value on the message reads the parsed copy under metadata" do
+      assert filters(~s|json_value(event_message, "$.auth_event.action") = 'login'|) == [
+               term("metadata.auth_event.action", "login")
+             ]
+    end
+
+    test "substring LIKE on an exact-match field matches a prefix, with or without a slash" do
+      assert [%{"bool" => %{"should" => [first, second]}}] = filters("path LIKE '%auth/v1%'")
+      assert first == %{"query_string" => %{"query" => "path:auth\\/v1*"}}
+      assert second == %{"query_string" => %{"query" => "path:\\/auth\\/v1*"}}
+    end
+
+    test "rejects columns that are neither grouped nor aggregated" do
+      assert {:error, message} =
+               Query.to_plan(:bq_sql, "SELECT level, avg(status) FROM #{@table}", %{})
+
+      assert message =~ "must appear in GROUP BY"
+    end
+  end
+
   describe "unsupported SQL" do
     for {name, sql, message} <- [
           {"joins", "SELECT a.id FROM t a JOIN t b ON a.id = b.id", "CROSS JOIN UNNEST"},
           {"unions", "SELECT id FROM t UNION ALL SELECT id FROM t", "no UNION"},
-          {"other aggregates", "SELECT sum(status) FROM t", "Unsupported function sum()"},
+          {"window functions", "SELECT row_number() OVER () FROM t", "Unsupported"},
           {"statements other than SELECT", "DELETE FROM t", "Only SELECT"},
           {"multiple statements", "SELECT 1; SELECT 2", "single SQL statement"},
           {"invalid SQL", "SELEKT", "SQL parse error"}
