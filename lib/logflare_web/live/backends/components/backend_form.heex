@@ -459,6 +459,31 @@
               The regionalized Axiom domain, defaults to the domain for the US region
             </small>
           </div>
+        <% "quickwit" -> %>
+          <div class="form-group">
+            {label(f_config, :endpoint, "Endpoint")}
+            {text_input(f_config, :endpoint,
+              class: "form-control",
+              value: input_value(f_config, :endpoint) || "http://localhost:7280"
+            )}
+            <small class="form-text text-muted">
+              Base URL of the Quickwit REST API, e.g. <code>http://quickwit:7280</code>
+            </small>
+          </div>
+          <div class="form-group">
+            {label(f_config, :index_id, "Index ID")}
+            {text_input(f_config, :index_id, class: "form-control")}
+            <small class="form-text text-muted">
+              Id of the Quickwit index to ingest into and query
+            </small>
+          </div>
+          <div class="form-group">
+            {label(f_config, :api_key, "API Key")}
+            {text_input(f_config, :api_key, class: "form-control", type: "password")}
+            <small class="form-text text-muted">
+              Optional bearer token when the Quickwit instance requires authentication
+            </small>
+          </div>
         <% "otlp" -> %>
           <div class="form-group">
             {label(f_config, :endpoint, "Endpoint")}
