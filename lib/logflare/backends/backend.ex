@@ -30,7 +30,8 @@ defmodule Logflare.Backends.Backend do
     signoz: Adaptor.SigNozAdaptor,
     syslog: Adaptor.SyslogAdaptor,
     splunk: Adaptor.SplunkAdaptor,
-    google_secops: Adaptor.GoogleSecOpsAdaptor
+    google_secops: Adaptor.GoogleSecOpsAdaptor,
+    quickwit: Adaptor.QuickwitAdaptor
   }
 
   @type_labels %{
@@ -50,7 +51,8 @@ defmodule Logflare.Backends.Backend do
     signoz: "SigNoz",
     syslog: "Syslog",
     splunk: "Splunk",
-    webhook: "Webhook"
+    webhook: "Webhook",
+    quickwit: "Quickwit"
   }
 
   @missing_type_labels Map.keys(@adaptor_mapping) -- Map.keys(@type_labels)
