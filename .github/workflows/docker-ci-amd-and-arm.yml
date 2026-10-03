@@ -23,22 +23,13 @@ jobs:
           echo "short_sha=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
   build:
     needs: settings
-    strategy:
-      matrix:
-        include:
-          - runner: us-east-1
-            arch: amd64
-          - runner: us-east-1
-            arch: arm64
     concurrency:
-      group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}-${{ matrix.arch }}
+      group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
       cancel-in-progress: ${{ github.event_name == 'push' }}
-    runs-on: ${{ matrix.runner }}
+    runs-on: [self-hosted, us-east-1]
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v6
-      - uses: docker/setup-qemu-action@v3
-        if: matrix.arch == 'arm64'
       # Setup docker
       # https://github.com/supabase/postgres/blob/develop/.github/workflows/dockerhub-release.yml#LL41C11-L42C44
       - run: docker context create builders
@@ -55,15 +46,14 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           push: true
-          tags: supabase/logflare:dev-${{ needs.settings.outputs.short_sha }}-${{ matrix.arch }}
-          platforms: linux/${{ matrix.arch }}
+          tags: supabase/logflare:dev-${{ needs.settings.outputs.short_sha }}-amd64
+          platforms: linux/amd64
           # Baked into the image as LOGFLARE_COMMIT_SHA and emitted as an OTel
           # resource attribute at runtime (see Dockerfile / Logflare.Telemetry).
           build-args: |
             COMMIT_SHA=${{ needs.settings.outputs.short_sha }}
-          # Keep architecture-specific caches from overwriting each other.
-          cache-from: type=gha,scope=app-${{ matrix.arch }}
-          cache-to: type=gha,scope=app-${{ matrix.arch }},mode=max
+          cache-from: type=gha,scope=app-amd64
+          cache-to: type=gha,scope=app-amd64,mode=max
 
   merge_publish:
     needs:
@@ -78,13 +68,12 @@ jobs:
       - name: Setup tags
         run: |
           echo "tag_amd64=supabase/logflare:dev-${{ needs.settings.outputs.short_sha }}-amd64" >> "$GITHUB_ENV"
-          echo "tag_arm64=supabase/logflare:dev-${{ needs.settings.outputs.short_sha }}-arm64" >> "$GITHUB_ENV"
           echo "tag_sha=supabase/logflare:dev-${{ needs.settings.outputs.short_sha }}" >> "$GITHUB_ENV"
-      - name: Staging - Merge multi-arch manifests and push the dev image
+      - name: Staging - Retag the amd64 image as the dev image
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         run: |
-          docker buildx imagetools create -t ${{ env.tag_sha }}  \
-          ${{ env.tag_amd64 }} ${{ env.tag_arm64 }}
+          docker buildx imagetools create -t ${{ env.tag_sha }} \
+          ${{ env.tag_amd64 }}
 
   trigger_cloudbuild:
     uses: ./.github/workflows/trigger-cloudbuild.yml

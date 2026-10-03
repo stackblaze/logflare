@@ -45,19 +45,10 @@ jobs:
 
   build:
     needs: settings
-    strategy:
-      matrix:
-        include:
-          - runner: us-east-1
-            arch: amd64
-          - runner: us-east-1
-            arch: arm64
-    runs-on: ${{ matrix.runner }}
+    runs-on: [self-hosted, us-east-1]
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v3
-      - uses: docker/setup-qemu-action@v3
-        if: matrix.arch == 'arm64'
       - run: docker context create builders
       - uses: docker/setup-buildx-action@v2
         with:
@@ -70,8 +61,8 @@ jobs:
       - uses: docker/build-push-action@v3
         with:
           push: true
-          tags: supabase/logflare:pr${{ needs.settings.outputs.pr_number }}-${{ needs.settings.outputs.short_sha }}-${{ matrix.arch }}
-          platforms: linux/${{ matrix.arch }}
+          tags: supabase/logflare:pr${{ needs.settings.outputs.pr_number }}-${{ needs.settings.outputs.short_sha }}-amd64
+          platforms: linux/amd64
           build-args: |
             COMMIT_SHA=${{ needs.settings.outputs.short_sha }}
           cache-from: type=gha
@@ -87,11 +78,11 @@ jobs:
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - name: Merge multi-arch manifests
+      - name: Retag the amd64 image as the PR image
         run: |
           tag=supabase/logflare:pr${{ needs.settings.outputs.pr_number }}-${{ needs.settings.outputs.short_sha }}
           docker buildx imagetools create -t "$tag" \
-            "${tag}-amd64" "${tag}-arm64"
+            "${tag}-amd64"
 
   deploy:
     needs:
