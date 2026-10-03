@@ -355,7 +355,7 @@ jobs:
           chmod 666 db/telegraf_output/metrics.out
 
       - name: Start Telegraf
-        run: docker compose up -d telegraf
+        run: docker compose up -d --force-recreate telegraf
 
       - name: Set up Elixir
         uses: erlef/setup-beam@v1
