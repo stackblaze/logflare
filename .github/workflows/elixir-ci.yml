@@ -169,6 +169,11 @@ jobs:
           rm -rf priv/docs
           cp -R docs/docs.logflare.com/docs priv/docs
 
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ needs.versions.outputs.rust }}
+
       - name: Install dependencies
         run: mix do deps.get + deps.compile
 
