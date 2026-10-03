@@ -1,0 +1,55 @@
+---
+sidebar_position: 14
+---
+
+# Quickwit
+
+The Quickwit backend stores events in a [Quickwit](https://quickwit.io) index and can serve [endpoint](/concepts/endpoints) queries from it.
+
+## Behaviour and configurations
+
+### Configuration
+
+- `endpoint`: (`string`, required) base URL of the Quickwit REST API, for example `http://quickwit:7280`. Defaults to `http://localhost:7280`.
+- `index_id`: (`string`, required) the index used for ingest and search. Must start with a letter and contain only letters, digits, `-` and `_` (3 to 255 characters).
+- `api_key`: (`string`, optional) sent as a bearer token, for Quickwit deployments behind an authenticating proxy.
+
+### Ingestion
+
+Events are sent as gzipped NDJSON to the [ingest API](https://quickwit.io/docs/reference/rest-api#ingest-data-into-an-index) (`POST /api/v1/{index_id}/ingest`), batched with a maximum of 250 events per request.
+
+The index is created the first time the backend is used. It has a dynamic mapping, so events of any shape are accepted:
+
+- every field is indexed as an exact (untokenized) value and stored as a fast field, so it can be filtered, sorted and aggregated on,
+- `event_message` is tokenized for phrase search,
+- `timestamp` is the index timestamp field.
+
+All sources attached to the backend share the index. Each document carries the token of its source in the `lf_source` field, and every query is restricted to the documents of the sources it names. Several backends, including backends of different users, may point at the same index.
+
+If you create the index yourself, keep `lf_source` as a raw-tokenized text field and `timestamp` as the timestamp field.
+
+### Querying
+
+Quickwit has no SQL interface. Endpoint queries are translated into requests for its Elasticsearch-compatible search API (`POST /api/v1/_elastic/{index_id}/_search`). Set the endpoint's backend to the Quickwit backend and write the query in BigQuery SQL, as for the default backend.
+
+The following is supported:
+
+- `SELECT` of fields or `*` from one source, with `WHERE`, `ORDER BY` a field, `LIMIT` (at most 1000 rows) and `OFFSET`.
+- CTEs that select from a source or from another CTE. The `WHERE` clauses of all levels are combined.
+- `CROSS JOIN UNNEST(metadata) AS m`. Nested fields are plain document paths in Quickwit, so `m.request.path` reads `metadata.request.path`. Unlike in BigQuery, the join does not drop events that lack the unnested field.
+- Conditions: `AND`, `OR`, `NOT`, `=`, `!=`, `<`, `<=`, `>`, `>=`, `IN`, `BETWEEN`, `IS [NOT] NULL`, `LIKE`, `regexp_contains`, `contains`, `starts_with`, boolean `CASE`, and `IFNULL`, `COALESCE`, `CAST` and `SAFE_CAST` around a field.
+- `count(*)`, `count(field)` and `count(CASE WHEN <condition> THEN 1 END)`.
+- Counts per time bucket: `SELECT timestamp_trunc(timestamp, minute), count(*) ... GROUP BY 1`, with `second`, `minute`, `hour`, `day` or `week` buckets.
+- Counts per value of a field: `SELECT level, count(*) ... GROUP BY level`.
+
+Other SQL (joins between sources, `UNION`, subqueries in `WHERE`, aggregates other than `count`) is rejected with an error that names the unsupported construct.
+
+#### Text matching
+
+Text search is token based. `regexp_contains(event_message, 'time out')` and `event_message LIKE '%time out%'` match events that contain the phrase, with the last word matched as a prefix. Alternation (`a|b`) is supported. Other regular expression syntax is not available in Quickwit and is reduced to the words it contains.
+
+Fields other than `event_message` are matched exactly. On those fields `LIKE` supports a trailing wildcard only (`path LIKE '/rest/%'`).
+
+#### Time buckets
+
+Buckets without events are omitted, as with `GROUP BY` on other backends.
