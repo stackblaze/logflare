@@ -38,17 +38,24 @@ The following is supported:
 - CTEs that select from a source or from another CTE. The `WHERE` clauses of all levels are combined.
 - `CROSS JOIN UNNEST(metadata) AS m`. Nested fields are plain document paths in Quickwit, so `m.request.path` reads `metadata.request.path`. Unlike in BigQuery, the join does not drop events that lack the unnested field.
 - Conditions: `AND`, `OR`, `NOT`, `=`, `!=`, `<`, `<=`, `>`, `>=`, `IN`, `BETWEEN`, `IS [NOT] NULL`, `LIKE`, `regexp_contains`, `contains`, `starts_with`, boolean `CASE`, and `IFNULL`, `COALESCE`, `CAST` and `SAFE_CAST` around a field.
-- `count(*)`, `count(field)` and `count(CASE WHEN <condition> THEN 1 END)`.
-- Counts per time bucket: `SELECT timestamp_trunc(timestamp, minute), count(*) ... GROUP BY 1`, with `second`, `minute`, `hour`, `day` or `week` buckets.
-- Counts per value of a field: `SELECT level, count(*) ... GROUP BY level`.
+- Aggregates: `count(*)`, `count(field)`, `count(DISTINCT field)`, `countif(<condition>)`, `count(CASE WHEN <condition> THEN 1 END)`, `sum`, `avg`, `min` and `max` of a field.
+- `GROUP BY` one or more fields, optionally with one time bucket: `timestamp_trunc(timestamp, minute)` with `second`, `minute`, `hour`, `day` or `week`. `ORDER BY` and `LIMIT` apply to the grouped rows.
+- Arithmetic (`+`, `-`, `*`, `/`), `round`, `safe_divide`, `coalesce` and `ifnull` over aggregates.
+- `json_value(event_message, '$.a.b')` reads `metadata.a.b`: structured log lines are expected to be stored parsed under `metadata`.
 
-Other SQL (joins between sources, `UNION`, subqueries in `WHERE`, aggregates other than `count`) is rejected with an error that names the unsupported construct.
+Other SQL (joins between sources, `UNION`, subqueries in `WHERE`, window functions, grouping by a computed expression such as `CASE`) is rejected with an error that names the unsupported construct.
+
+Differences from BigQuery when grouping:
+
+- Events that lack a grouped field are left out, there is no `NULL` group.
+- At most 1000 groups per level are returned, the most frequent first.
+- `count(DISTINCT field)` is exact up to 1000 distinct values per group.
 
 #### Text matching
 
 Text search is token based. `regexp_contains(event_message, 'time out')` and `event_message LIKE '%time out%'` match events that contain the phrase, with the last word matched as a prefix. Alternation (`a|b`) is supported. Other regular expression syntax is not available in Quickwit and is reduced to the words it contains.
 
-Fields other than `event_message` are matched exactly. On those fields `LIKE` supports a trailing wildcard only (`path LIKE '/rest/%'`).
+Fields other than `event_message` are matched exactly. On those fields `LIKE 'x%'` matches a prefix, and `LIKE '%x%'` matches values that start with `x`, optionally after a leading `/` (enough to filter by path); a true substring match is not available.
 
 #### Time buckets
 
