@@ -26,7 +26,7 @@ jobs:
     # Reviews are advisory: an action, model, or authentication failure must
     # remain visible in this job's logs without blocking other CI or merging.
     continue-on-error: true
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, us-east-1]
     timeout-minutes: 20
     permissions:
       contents: read

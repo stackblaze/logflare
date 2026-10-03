@@ -15,7 +15,7 @@ permissions:
 jobs:
   versions:
     name: Get versions
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, us-east-1]
     outputs:
       elixir: ${{ steps.v.outputs.elixir }}
       erlang: ${{ steps.v.outputs.erlang }}
@@ -31,7 +31,7 @@ jobs:
 
   build:
     name: Build and test
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, us-east-1]
     needs: versions
     services:
       postgres:

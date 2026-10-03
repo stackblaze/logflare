@@ -24,7 +24,7 @@ permissions:
 # dev-<sha> tags docker-ci-amd-and-arm.yml produces for main.
 jobs:
   settings:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, us-east-1]
     outputs:
       short_sha: ${{ steps.env.outputs.short_sha }}
       pr_number: ${{ steps.pr.outputs.number }}
@@ -48,14 +48,16 @@ jobs:
     strategy:
       matrix:
         include:
-          - runner: blacksmith-4vcpu-ubuntu-2404
+          - runner: us-east-1
             arch: amd64
-          - runner: blacksmith-4vcpu-ubuntu-2404-arm
+          - runner: us-east-1
             arch: arm64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v3
+      - uses: docker/setup-qemu-action@v3
+        if: matrix.arch == 'arm64'
       - run: docker context create builders
       - uses: docker/setup-buildx-action@v2
         with:
@@ -79,7 +81,7 @@ jobs:
     needs:
       - settings
       - build
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, us-east-1]
     steps:
       - uses: docker/login-action@v2
         with:
@@ -95,7 +97,7 @@ jobs:
     needs:
       - settings
       - merge_publish
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, us-east-1]
     concurrency:
       # Different dev numbers deploy independently; same dev number serializes.
       group: deploy-pr-to-dev-${{ inputs.dev_number }}

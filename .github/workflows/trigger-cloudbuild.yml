@@ -21,7 +21,7 @@ jobs:
       # Stale main-push jobs self-skip after acquiring the group.
       queue: max
       cancel-in-progress: false
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, us-east-1]
     steps:
       # setup deps and env vars
       - uses: actions/checkout@v3

@@ -37,7 +37,7 @@ concurrency:
 jobs:
   versions:
     name: Get versions
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, us-east-1]
     outputs:
       elixir: ${{ steps.v.outputs.elixir }}
       erlang: ${{ steps.v.outputs.erlang }}
@@ -119,7 +119,7 @@ jobs:
 
   quality:
     name: Checks (${{ matrix.commands.name }}, ${{ matrix.commands.run }})
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, us-east-1]
     needs: versions
     if: needs.versions.outputs.quality == 'true'
     strategy:
@@ -174,7 +174,7 @@ jobs:
 
   compile:
     name: Checks (Compilation Warnings, mix test.compile)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, us-east-1]
     needs: versions
     if: needs.versions.outputs.backend == 'true'
     env:
@@ -230,7 +230,7 @@ jobs:
 
   typing:
     name: Checks (Typing check, mix test.typings)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, us-east-1]
     needs: versions
     if: needs.versions.outputs.backend == 'true'
     env:
@@ -295,7 +295,7 @@ jobs:
 
   test:
     name: Checks (Tests, epmd -daemon; mix do ecto.create + ecto.migrate + test.coverage.ci)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, us-east-1]
     needs: versions
     if: needs.versions.outputs.backend == 'true'
     services:
@@ -403,7 +403,7 @@ jobs:
 
   rust:
     name: Rust unit tests
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, us-east-1]
     needs: versions
     if: needs.versions.outputs.rust_changed == 'true'
     steps:
@@ -430,7 +430,7 @@ jobs:
 
   frontend:
     name: Frontend JavaScript Unit Tests (assets)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, us-east-1]
     needs: versions
     if: needs.versions.outputs.frontend == 'true'
     steps:

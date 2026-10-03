@@ -30,7 +30,7 @@ concurrency:
 jobs:
   pglogical-replica:
     name: pglogical DDL replication integration tests
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, us-east-1]
     services:
       postgres:
         image: bitnamilegacy/postgresql:15

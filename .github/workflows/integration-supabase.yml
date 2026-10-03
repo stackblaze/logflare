@@ -16,7 +16,7 @@ defaults:
 jobs:
   build-image:
     name: Build Logflare image
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, us-east-1]
     timeout-minutes: 30
     steps:
     - uses: actions/checkout@v6
@@ -45,7 +45,7 @@ jobs:
 
   test:
     name: Playwright Tests (${{ matrix.backend }}, ${{ matrix.browsers.name }})
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, us-east-1]
     needs: build-image
 
     strategy:
