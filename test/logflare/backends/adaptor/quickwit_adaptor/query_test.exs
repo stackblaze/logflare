@@ -299,6 +299,40 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor.QueryTest do
       assert second == %{"query_string" => %{"query" => "path:\\/auth\\/v1*"}}
     end
 
+    test "regexp_contains on an exact-match field matches a prefix too" do
+      assert filters("regexp_contains(path, '/rest')") ==
+               filters("path LIKE '%/rest%'")
+    end
+
+    test "a key computed with CASE is grouped by its fields and merged afterwards" do
+      plan =
+        plan!("""
+        SELECT CASE WHEN provider IS NOT NULL AND provider != '' THEN concat(method, ' (', provider, ')')
+               ELSE method END AS label, count(*) AS count
+        FROM #{@table}
+        GROUP BY label
+        """)
+
+      assert plan.merge
+
+      assert plan.keys == [
+               {nil, {:term, "provider", :missing}},
+               {nil, {:term, "method", :missing}}
+             ]
+
+      assert [{"label", {:computed, {:case, [{condition, concat}], {:key, 1}}}}, {"count", _}] =
+               plan.columns
+
+      assert condition == {:and, {:present, {:key, 0}}, {:neq, {:key, 0}, {:const, ""}}}
+      assert concat == {:concat, [{:key, 1}, {:const, " ("}, {:key, 0}, {:const, ")"}]}
+    end
+
+    test "a computed key cannot be combined with avg" do
+      sql = "SELECT CASE WHEN a = 'x' THEN b ELSE a END AS k, avg(n) FROM #{@table} GROUP BY k"
+      assert {:error, message} = Query.to_plan(:bq_sql, sql, %{})
+      assert message =~ "only supports count()"
+    end
+
     test "rejects columns that are neither grouped nor aggregated" do
       assert {:error, message} =
                Query.to_plan(:bq_sql, "SELECT level, avg(status) FROM #{@table}", %{})

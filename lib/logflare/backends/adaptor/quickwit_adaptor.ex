@@ -284,6 +284,8 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor do
 
       rows = for {key, _base} <- groups[plan.query], do: aggregate_row(plan, groups, key)
 
+      rows = if plan.merge, do: merge_rows(rows, plan.columns), else: rows
+
       {:ok, rows |> order_rows(plan.order) |> Enum.take(plan.limit)}
     end
   end
@@ -317,6 +319,10 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor do
     do: %{date_histogram: %{field: "timestamp", fixed_interval: interval}}
 
   defp key_aggregation({:term, field}, size), do: %{terms: %{field: field, size: size}}
+
+  # for computed keys: events without the field still form a group, with "" as its value
+  defp key_aggregation({:term, field, :missing}, size),
+    do: %{terms: %{field: field, size: size, missing: ""}}
 
   # Quickwit has no cardinality aggregation: distinct values are counted as term buckets.
   defp metric_aggregation(:distinct, field, size), do: %{terms: %{field: field, size: size}}
@@ -359,6 +365,8 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor do
     key_value(kind, Enum.at(key, index))
   end
 
+  defp evaluate({:computed, expr}, key, _values, _keys), do: value(expr, key)
+
   defp evaluate({:call, fun, args}, key, values, keys),
     do: call(fun, Enum.map(args, &evaluate(&1, key, values, keys)))
 
@@ -373,6 +381,40 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor do
   end
 
   defp key_value({:term, _field}, value), do: value
+
+  defp key_value({:term, _field, :missing}, value), do: value
+
+  # Evaluates a computed key on one group's field values; a missing field reads as "".
+  defp value({:key, index}, key), do: Enum.at(key, index)
+  defp value({:const, value}, _key), do: value
+  defp value({:concat, parts}, key), do: Enum.map_join(parts, &to_string(value(&1, key)))
+
+  defp value({:case, branches, otherwise}, key) do
+    case Enum.find(branches, fn {condition, _result} -> holds?(condition, key) end) do
+      {_condition, result} -> value(result, key)
+      nil -> value(otherwise, key)
+    end
+  end
+
+  defp holds?({:and, left, right}, key), do: holds?(left, key) and holds?(right, key)
+  defp holds?({:or, left, right}, key), do: holds?(left, key) or holds?(right, key)
+  defp holds?({:present, expr}, key), do: value(expr, key) not in [nil, ""]
+  defp holds?({:absent, expr}, key), do: value(expr, key) in [nil, ""]
+  defp holds?({:eq, left, right}, key), do: value(left, key) == value(right, key)
+  defp holds?({:neq, left, right}, key), do: value(left, key) != value(right, key)
+
+  # Groups that share their key columns after a computed key was evaluated: add up the counts.
+  defp merge_rows(rows, columns) do
+    counts = for {name, expr} <- columns, match?({:metric, _}, expr), do: name
+
+    rows
+    |> Enum.group_by(&Map.drop(&1, counts))
+    |> Enum.map(fn {keys, group} ->
+      Enum.reduce(counts, keys, fn name, row ->
+        Map.put(row, name, group |> Enum.map(&(&1[name] || 0)) |> Enum.sum())
+      end)
+    end)
+  end
 
   defp call(:coalesce, values), do: Enum.find(values, &(not is_nil(&1)))
   defp call(:round, [value]) when is_number(value), do: round(value)

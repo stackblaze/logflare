@@ -97,16 +97,21 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor.Query do
               columns: [{String.t(), expression()}],
               order: [{String.t(), :asc | :desc}],
               limit: pos_integer(),
-              size: pos_integer()
+              size: pos_integer(),
+              merge: boolean()
             }
 
   @type column :: {:path, [String.t()]} | {:datetime, [String.t()]}
-  @type key :: {:bucket, String.t(), :micros | :datetime} | {:term, String.t()}
+  @type key ::
+          {:bucket, String.t(), :micros | :datetime}
+          | {:term, String.t()}
+          | {:term, String.t(), :missing}
   @type expression ::
           {:key, non_neg_integer()}
           | {:metric, String.t()}
           | {:const, term()}
           | {:call, atom(), [expression()]}
+          | {:computed, tuple()}
 
   @spec source_field() :: String.t()
   def source_field, do: @source_field
@@ -525,8 +530,13 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor.Query do
         {{name || default_name(expr, compiled), compiled}, metrics}
       end)
 
-    keys = Enum.map(group_by(select, ctx), &group_key(&1, items, ctx))
-    key_values = Enum.map(keys, fn {_name, key} -> key end)
+    grouped = Enum.map(group_by(select, ctx), &group_key(&1, items, ctx))
+    key_values = Enum.map(grouped, fn {_name, key} -> key end)
+    computed? = Enum.any?(key_values, &match?({:computed, _}, &1))
+    keys = grouped |> Enum.flat_map(&key_fields/1) |> Enum.uniq()
+
+    if computed? and Enum.any?(metrics, fn {_id, kind, _field, _filter} -> kind != :count end),
+      do: unsupported("Grouping by an expression only supports count()")
 
     for {name, {:key, key}} <- items, key not in key_values do
       unsupported("Column #{name} must appear in GROUP BY or be aggregated")
@@ -547,9 +557,31 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor.Query do
        columns: for({name, compiled} <- items, do: {name, column_expr(compiled, keys)}),
        order: aggregate_order(query, items),
        limit: min(limit(query) || @max_limit, @max_limit),
-       size: @terms_size
+       size: @terms_size,
+       merge: computed?
      }}
   end
+
+  # A key computed from fields (CASE, CONCAT) is grouped by those fields; the adaptor
+  # evaluates it per group and merges the groups that end up with the same value.
+  defp key_fields({_name, {:computed, expr}}),
+    do: for(field <- value_fields(expr), do: {nil, {:term, field, :missing}})
+
+  defp key_fields(key), do: [key]
+
+  defp value_fields({:field, field}), do: [field]
+  defp value_fields(tuple) when is_tuple(tuple), do: tuple |> Tuple.to_list() |> value_fields()
+  defp value_fields(list) when is_list(list), do: Enum.flat_map(list, &value_fields/1)
+  defp value_fields(_), do: []
+
+  defp index_fields({:field, field}, keys),
+    do: {:key, Enum.find_index(keys, fn {_name, key} -> key == {:term, field, :missing} end)}
+
+  defp index_fields(tuple, keys) when is_tuple(tuple),
+    do: tuple |> Tuple.to_list() |> index_fields(keys) |> List.to_tuple()
+
+  defp index_fields(list, keys) when is_list(list), do: Enum.map(list, &index_fields(&1, keys))
+  defp index_fields(other, _keys), do: other
 
   defp aliased(%{"UnnamedExpr" => expr}), do: {expr, nil}
 
@@ -560,11 +592,14 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor.Query do
 
   defp default_name(_expr, {:key, {:term, field}}), do: field |> String.split(".") |> List.last()
   defp default_name(_expr, {:key, {:bucket, _, _}}), do: @timestamp_field
+  defp default_name(_expr, {:key, {:computed, _}}), do: "f0_"
   defp default_name(%{"Function" => function}, _compiled), do: function_name(function)
   defp default_name(_expr, _compiled), do: "f0_"
 
   # Keys become references by position among the plan's keys, so the adaptor can read them
   # from a bucket path.
+  defp column_expr({:key, {:computed, expr}}, keys), do: {:computed, index_fields(expr, keys)}
+
   defp column_expr({:key, key}, keys),
     do: {:key, Enum.find_index(keys, fn {_name, k} -> k == key end)}
 
@@ -631,12 +666,60 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor.Query do
 
   defp cast_bucket(compiled, _kind), do: compiled
 
+  defp aggregate_operand(%{"Case" => _} = expr, ctx, metrics),
+    do: {{:key, {:computed, value_expr(expr, ctx)}}, metrics}
+
   defp aggregate_operand(expr, ctx, metrics) do
     case operand(expr, ctx) do
       {:field, path, _default, _cast} -> {{:key, {:term, Enum.join(path, ".")}}, metrics}
       {:value, value} -> {{:const, value}, metrics}
     end
   end
+
+  # A per-row expression over fields, evaluated by the adaptor on group keys.
+  defp value_expr(%{"Nested" => expr}, ctx), do: value_expr(expr, ctx)
+  defp value_expr(nil, _ctx), do: {:const, nil}
+
+  defp value_expr(%{"Case" => %{"operand" => nil, "conditions" => whens} = kase}, ctx) do
+    branches =
+      for %{"condition" => condition, "result" => result} <- whens,
+          do: {value_condition(condition, ctx), value_expr(result, ctx)}
+
+    {:case, branches, value_expr(kase["else_result"], ctx)}
+  end
+
+  defp value_expr(%{"Function" => function} = expr, ctx) do
+    case function_name(function) do
+      "concat" -> {:concat, Enum.map(function_args(function), &value_expr(&1, ctx))}
+      _ -> value_operand(expr, ctx)
+    end
+  end
+
+  defp value_expr(expr, ctx), do: value_operand(expr, ctx)
+
+  defp value_operand(expr, ctx) do
+    case operand(expr, ctx) do
+      {:field, path, _default, _cast} -> {:field, Enum.join(path, ".")}
+      {:value, value} -> {:const, value}
+    end
+  end
+
+  @value_operators %{"And" => :and, "Or" => :or, "Eq" => :eq, "NotEq" => :neq}
+
+  defp value_condition(%{"Nested" => expr}, ctx), do: value_condition(expr, ctx)
+  defp value_condition(%{"IsNotNull" => expr}, ctx), do: {:present, value_expr(expr, ctx)}
+  defp value_condition(%{"IsNull" => expr}, ctx), do: {:absent, value_expr(expr, ctx)}
+
+  defp value_condition(%{"BinaryOp" => %{"left" => left, "op" => op, "right" => right}}, ctx)
+       when op in ["And", "Or"],
+       do: {@value_operators[op], value_condition(left, ctx), value_condition(right, ctx)}
+
+  defp value_condition(%{"BinaryOp" => %{"left" => left, "op" => op, "right" => right}}, ctx)
+       when op in ["Eq", "NotEq"],
+       do: {@value_operators[op], value_expr(left, ctx), value_expr(right, ctx)}
+
+  defp value_condition(_expr, _ctx),
+    do: unsupported("Unsupported condition in a grouped CASE expression")
 
   defp bucket_expr?(%{"Function" => function}),
     do: function_name(function) in ~w(timestamp_trunc datetime_trunc date_trunc)
@@ -1206,10 +1289,8 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor.Query do
       String.ends_with?(pattern, "%") and not String.starts_with?(pattern, "%") ->
         prefix(field, core)
 
-      # Exact-match fields cannot be searched for a substring. `%x%` matches values that
-      # start with x, optionally after a leading slash, which covers filtering by path.
       String.starts_with?(pattern, "%") and String.ends_with?(pattern, "%") ->
-        any_of([prefix(field, core), prefix(field, "/" <> String.trim_leading(core, "/"))])
+        substring(field, core)
 
       true ->
         unsupported(
@@ -1252,7 +1333,14 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor.Query do
 
   # Other fields are indexed as single raw tokens: exact or prefix only.
   defp phrase(field, text, :prefix), do: prefix(field, text)
-  defp phrase(field, text, :contains), do: term(field, text)
+  defp phrase(field, text, :contains), do: substring(field, text)
+
+  # An exact-match field cannot be searched for a substring. Values that start with the
+  # text, with or without a leading slash, cover filtering by path (`/rest`, `auth/v1`).
+  defp substring(field, text) do
+    bare = String.trim_leading(text, "/")
+    any_of([prefix(field, bare), prefix(field, "/" <> bare)])
+  end
 
   defp prefix(field, text) do
     escaped = String.replace(text, ~r/([+\-!(){}\[\]^"~*?:\\\/ ])/, "\\\\\\1")

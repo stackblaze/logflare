@@ -424,6 +424,44 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptorTest do
              ]
     end
 
+    test "evaluates a computed key per group and merges equal values", ctx do
+      mock_adapter(fn env ->
+        assert %{"k0" => %{"terms" => %{"field" => "provider", "missing" => ""}}} =
+                 Jason.decode!(env.body)["aggs"]
+
+        methods = fn pairs ->
+          %{"buckets" => for({key, count} <- pairs, do: %{"key" => key, "doc_count" => count})}
+        end
+
+        buckets = [
+          %{"key" => "", "doc_count" => 5, "k1" => methods.([{"password", 3}, {"otp", 2}])},
+          %{"key" => "github", "doc_count" => 4, "k1" => methods.([{"oauth", 4}])},
+          %{"key" => "email", "doc_count" => 1, "k1" => methods.([{"password", 1}])}
+        ]
+
+        {:ok,
+         %Tesla.Env{status: 200, body: %{"aggregations" => %{"k0" => %{"buckets" => buckets}}}}}
+      end)
+
+      sql = """
+      SELECT CASE WHEN provider IS NOT NULL AND provider != '' AND provider != 'email'
+                  THEN concat(method, ' (', provider, ')') ELSE method END AS label,
+             count(*) AS count
+      FROM #{ctx.table}
+      GROUP BY label
+      ORDER BY count DESC
+      """
+
+      assert {:ok, %QueryResult{rows: rows}} =
+               @subject.execute_query(ctx.backend, {sql, [], %{}}, [])
+
+      assert rows == [
+               %{"label" => "oauth (github)", "count" => 4},
+               %{"label" => "password", "count" => 4},
+               %{"label" => "otp", "count" => 2}
+             ]
+    end
+
     test "returns invalid_query error for unsupported SQL", ctx do
       reject(HttpBased.Client, :new, 1)
 
