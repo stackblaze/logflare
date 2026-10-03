@@ -41,9 +41,10 @@ The following is supported:
 - Aggregates: `count(*)`, `count(field)`, `count(DISTINCT field)`, `countif(<condition>)`, `count(CASE WHEN <condition> THEN 1 END)`, `sum`, `avg`, `min` and `max` of a field.
 - `GROUP BY` one or more fields, optionally with one time bucket: `timestamp_trunc(timestamp, minute)` with `second`, `minute`, `hour`, `day` or `week`. `ORDER BY` and `LIMIT` apply to the grouped rows.
 - Arithmetic (`+`, `-`, `*`, `/`), `round`, `safe_divide`, `coalesce` and `ifnull` over aggregates.
+- `GROUP BY` a `CASE`/`CONCAT` expression over fields, with `count()` only: grouped by the fields it uses, evaluated per group, and equal results merged.
 - `json_value(event_message, '$.a.b')` reads `metadata.a.b`: structured log lines are expected to be stored parsed under `metadata`.
 
-Other SQL (joins between sources, `UNION`, subqueries in `WHERE`, window functions, grouping by a computed expression such as `CASE`) is rejected with an error that names the unsupported construct.
+Other SQL (joins between sources, `UNION`, subqueries in `WHERE`, window functions) is rejected with an error that names the unsupported construct.
 
 Differences from BigQuery when grouping:
 
@@ -55,7 +56,7 @@ Differences from BigQuery when grouping:
 
 Text search is token based. `regexp_contains(event_message, 'time out')` and `event_message LIKE '%time out%'` match events that contain the phrase, with the last word matched as a prefix. Alternation (`a|b`) is supported. Other regular expression syntax is not available in Quickwit and is reduced to the words it contains.
 
-Fields other than `event_message` are matched exactly. On those fields `LIKE 'x%'` matches a prefix, and `LIKE '%x%'` matches values that start with `x`, optionally after a leading `/` (enough to filter by path); a true substring match is not available.
+Fields other than `event_message` are matched exactly. A substring search on them (`LIKE '%x%'`, `regexp_contains`, `contains`) matches values that start with `x`, optionally after a leading `/`, which is enough to filter by path; a true substring match is not available. `LIKE 'x%'` matches a prefix.
 
 #### Time buckets
 
