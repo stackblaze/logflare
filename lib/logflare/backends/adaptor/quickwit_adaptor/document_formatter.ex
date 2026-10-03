@@ -25,8 +25,11 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor.DocumentFormatter do
       [] when env.body != [] ->
         {:error, :all_events_dropped}
 
-      body ->
-        headers = Enum.reject(env.headers, fn {key, _value} -> String.downcase(key) == "content-type" end)
+      encoded ->
+        body = if is_list(encoded), do: IO.iodata_to_binary(encoded), else: encoded
+
+        headers =
+          Enum.reject(env.headers, fn {key, _value} -> String.downcase(key) == "content-type" end)
 
         %{env | headers: headers}
         |> Tesla.put_header("content-type", @content_type)

@@ -61,10 +61,31 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor.Query do
   @type es_query :: map()
 
   @type plan ::
-          %{shape: :rows, query: es_query(), size: non_neg_integer(), from: non_neg_integer(), sort: [map()], columns: :all | [{String.t(), column()}]}
+          %{
+            shape: :rows,
+            query: es_query(),
+            size: non_neg_integer(),
+            from: non_neg_integer(),
+            sort: [map()],
+            columns: :all | [{String.t(), column()}]
+          }
           | %{shape: :counts, counters: [{String.t(), es_query()}]}
-          | %{shape: :histogram, column: String.t(), interval: String.t(), order: :asc | :desc, query: es_query(), counters: [{String.t(), es_query()}]}
-          | %{shape: :terms, column: String.t(), field: String.t(), query: es_query(), counters: [{String.t(), es_query()}], size: pos_integer()}
+          | %{
+              shape: :histogram,
+              column: String.t(),
+              interval: String.t(),
+              order: :asc | :desc,
+              query: es_query(),
+              counters: [{String.t(), es_query()}]
+            }
+          | %{
+              shape: :terms,
+              column: String.t(),
+              field: String.t(),
+              query: es_query(),
+              counters: [{String.t(), es_query()}],
+              size: pos_integer()
+            }
 
   @type column :: {:path, [String.t()]} | {:datetime, [String.t()]}
 
@@ -138,17 +159,21 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor.Query do
       ctx = %{scope: scope, params: params}
       own = if select["selection"], do: condition(select["selection"], ctx), else: true
 
-      case Map.fetch(ctes, table) do
-        {:ok, cte_query} ->
-          with {:ok, cte_select} <- select_of(cte_query),
-               {:ok, inherited, _scope} <-
-                 base_filter(cte_select, Map.delete(ctes, table), params, depth + 1) do
-            {:ok, all_of([inherited, own]), scope}
-          end
-
-        :error ->
-          {:ok, all_of([term(@source_field, source_token(table)), own]), scope}
+      with {:ok, inherited} <- table_filter(table, ctes, params, depth) do
+        {:ok, all_of([inherited, own]), scope}
       end
+    end
+  end
+
+  defp table_filter(table, ctes, params, depth) do
+    with {:ok, cte_query} <- Map.fetch(ctes, table),
+         {:ok, cte_select} <- select_of(cte_query),
+         {:ok, inherited, _scope} <-
+           base_filter(cte_select, Map.delete(ctes, table), params, depth + 1) do
+      {:ok, inherited}
+    else
+      :error -> {:ok, term(@source_field, source_token(table))}
+      {:error, _reason} = error -> error
     end
   end
 
@@ -190,7 +215,10 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor.Query do
   defp source_token(table) do
     name = table |> String.split(".") |> List.last() |> String.replace("`", "")
 
-    case Regex.run(~r/([0-9a-f]{8})_([0-9a-f]{4})_([0-9a-f]{4})_([0-9a-f]{4})_([0-9a-f]{12})$/i, name) do
+    case Regex.run(
+           ~r/([0-9a-f]{8})_([0-9a-f]{4})_([0-9a-f]{4})_([0-9a-f]{4})_([0-9a-f]{12})$/i,
+           name
+         ) do
       [_ | groups] -> groups |> Enum.join("-") |> String.downcase()
       nil -> name
     end
@@ -237,8 +265,11 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor.Query do
 
   defp projection_item(%{"UnnamedExpr" => expr}, ctx), do: projection_expr(expr, nil, ctx)
 
-  defp projection_item(%{"ExprWithAlias" => %{"expr" => expr, "alias" => %{"value" => name}}}, ctx),
-    do: projection_expr(expr, name, ctx)
+  defp projection_item(
+         %{"ExprWithAlias" => %{"expr" => expr, "alias" => %{"value" => name}}},
+         ctx
+       ),
+       do: projection_expr(expr, name, ctx)
 
   defp projection_item(%{"Wildcard" => _}, _ctx), do: :all
   defp projection_item(%{"QualifiedWildcard" => _}, _ctx), do: :all
@@ -284,7 +315,8 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor.Query do
     else_counts? = not null_literal?(kase["else_result"])
 
     {filters, _} =
-      Enum.reduce(whens, {[], true}, fn %{"condition" => condition, "result" => result}, {acc, remaining} ->
+      Enum.reduce(whens, {[], true}, fn %{"condition" => condition, "result" => result},
+                                        {acc, remaining} ->
         matches = all_of([remaining, condition(condition, ctx)])
         acc = if null_literal?(result), do: acc, else: [matches | acc]
         {acc, all_of([remaining, negate(condition(condition, ctx), condition, ctx)])}
@@ -310,12 +342,19 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor.Query do
 
   defp interval!(unit) do
     case Map.fetch(@intervals, String.downcase(to_string(unit))) do
-      {:ok, interval} -> interval
-      :error -> unsupported("Unsupported time bucket #{inspect(unit)}, use second, minute, hour, day or week")
+      {:ok, interval} ->
+        interval
+
+      :error ->
+        unsupported(
+          "Unsupported time bucket #{inspect(unit)}, use second, minute, hour, day or week"
+        )
     end
   end
 
-  defp group_by(%{"group_by" => %{"Expressions" => [exprs | _]}}, _ctx) when is_list(exprs), do: exprs
+  defp group_by(%{"group_by" => %{"Expressions" => [exprs | _]}}, _ctx) when is_list(exprs),
+    do: exprs
+
   defp group_by(_, _ctx), do: []
 
   # GROUP BY refers to a SELECT item by alias, position or expression.
@@ -339,7 +378,8 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor.Query do
          }}
 
       {:bucket, _name, _path, _interval} ->
-        {:error, "Time buckets are only supported on the timestamp field, as the only non-count column"}
+        {:error,
+         "Time buckets are only supported on the timestamp field, as the only non-count column"}
 
       {:column, name, {_kind, path}} when length(others) == 1 ->
         {:ok,
@@ -408,7 +448,9 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor.Query do
     end
   end
 
-  defp order_exprs(%{"order_by" => %{"kind" => %{"Expressions" => exprs}}}) when is_list(exprs), do: exprs
+  defp order_exprs(%{"order_by" => %{"kind" => %{"Expressions" => exprs}}}) when is_list(exprs),
+    do: exprs
+
   defp order_exprs(_), do: []
 
   defp direction(%{"options" => %{"sort" => "Desc"}}), do: :desc
@@ -442,13 +484,23 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor.Query do
     end
   end
 
-  defp limit(%{"limit_clause" => %{"LimitOffset" => %{"limit" => %{"Value" => %{"value" => %{"Number" => [n, _]}}}}}}),
-    do: String.to_integer(n)
+  defp limit(%{
+         "limit_clause" => %{
+           "LimitOffset" => %{"limit" => %{"Value" => %{"value" => %{"Number" => [n, _]}}}}
+         }
+       }),
+       do: String.to_integer(n)
 
   defp limit(_), do: nil
 
-  defp offset(%{"limit_clause" => %{"LimitOffset" => %{"offset" => %{"value" => %{"Value" => %{"value" => %{"Number" => [n, _]}}}}}}}),
-    do: String.to_integer(n)
+  defp offset(%{
+         "limit_clause" => %{
+           "LimitOffset" => %{
+             "offset" => %{"value" => %{"Value" => %{"value" => %{"Number" => [n, _]}}}}
+           }
+         }
+       }),
+       do: String.to_integer(n)
 
   defp offset(_), do: 0
 
@@ -473,16 +525,34 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor.Query do
     compare(operand(left, ctx), op, operand(right, ctx))
   end
 
-  defp condition(%{"InList" => %{"expr" => expr, "list" => list, "negated" => negated}} = node, ctx) do
+  defp condition(
+         %{"InList" => %{"expr" => expr, "list" => list, "negated" => negated}} = node,
+         ctx
+       ) do
     left = operand(expr, ctx)
     result = any_of(for item <- list, do: compare(left, "Eq", operand(item, ctx)))
-    if negated, do: negate(result, %{node | "InList" => %{node["InList"] | "negated" => false}}, ctx), else: result
+
+    if negated,
+      do: negate(result, %{node | "InList" => %{node["InList"] | "negated" => false}}, ctx),
+      else: result
   end
 
-  defp condition(%{"Between" => %{"expr" => expr, "low" => low, "high" => high, "negated" => negated}} = node, ctx) do
+  defp condition(
+         %{"Between" => %{"expr" => expr, "low" => low, "high" => high, "negated" => negated}} =
+           node,
+         ctx
+       ) do
     left = operand(expr, ctx)
-    result = all_of([compare(left, "GtEq", operand(low, ctx)), compare(left, "LtEq", operand(high, ctx))])
-    if negated, do: negate(result, %{node | "Between" => %{node["Between"] | "negated" => false}}, ctx), else: result
+
+    result =
+      all_of([
+        compare(left, "GtEq", operand(low, ctx)),
+        compare(left, "LtEq", operand(high, ctx))
+      ])
+
+    if negated,
+      do: negate(result, %{node | "Between" => %{node["Between"] | "negated" => false}}, ctx),
+      else: result
   end
 
   defp condition(%{"IsNull" => expr}, ctx) do
@@ -504,8 +574,11 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor.Query do
   defp condition(%{"Like" => like}, ctx), do: like_condition(like, ctx)
   defp condition(%{"ILike" => like}, ctx), do: like_condition(like, ctx)
 
-  defp condition(%{"Case" => %{"operand" => nil, "conditions" => whens, "else_result" => else_result}}, ctx),
-    do: case_condition(whens, else_result, ctx)
+  defp condition(
+         %{"Case" => %{"operand" => nil, "conditions" => whens, "else_result" => else_result}},
+         ctx
+       ),
+       do: case_condition(whens, else_result, ctx)
 
   defp condition(%{"Function" => function} = expr, ctx) do
     case {function_name(function), function_args(function)} do
@@ -591,8 +664,12 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor.Query do
 
   defp required_fields(expr, ctx) when is_map(expr) do
     case expr do
-      %{"Identifier" => _} -> field_or_nothing(expr, ctx)
-      %{"CompoundIdentifier" => _} -> field_or_nothing(expr, ctx)
+      %{"Identifier" => _} ->
+        field_or_nothing(expr, ctx)
+
+      %{"CompoundIdentifier" => _} ->
+        field_or_nothing(expr, ctx)
+
       %{"Function" => function} ->
         if function_name(function) in ["ifnull", "coalesce"] do
           []
@@ -605,7 +682,9 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor.Query do
     end
   end
 
-  defp required_fields(list, ctx) when is_list(list), do: Enum.flat_map(list, &required_fields(&1, ctx))
+  defp required_fields(list, ctx) when is_list(list),
+    do: Enum.flat_map(list, &required_fields(&1, ctx))
+
   defp required_fields(_other, _ctx), do: []
 
   defp field_or_nothing(expr, ctx) do
@@ -637,10 +716,17 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor.Query do
     case {function_name(function), function_args(function)} do
       {name, [first, fallback]} when name in ["ifnull", "coalesce", "nvl"] ->
         case {operand(first, ctx), operand(fallback, ctx)} do
-          {{:field, path, :none, cast}, {:value, default}} -> {:field, path, {:default, default}, cast}
-          {{:field, _, _, _} = field, _} -> field
-          {{:value, nil}, fallback} -> fallback
-          {{:value, _} = value, _} -> value
+          {{:field, path, :none, cast}, {:value, default}} ->
+            {:field, path, {:default, default}, cast}
+
+          {{:field, _, _, _} = field, _} ->
+            field
+
+          {{:value, nil}, fallback} ->
+            fallback
+
+          {{:value, _} = value, _} ->
+            value
         end
 
       {name, [arg]} when name in ["lower", "upper", "trim", "string", "to_json_string"] ->
@@ -726,10 +812,19 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor.Query do
 
   ## Comparisons
 
-  @flip %{"Eq" => "Eq", "NotEq" => "NotEq", "Gt" => "Lt", "GtEq" => "LtEq", "Lt" => "Gt", "LtEq" => "GtEq"}
+  @flip %{
+    "Eq" => "Eq",
+    "NotEq" => "NotEq",
+    "Gt" => "Lt",
+    "GtEq" => "LtEq",
+    "Lt" => "Gt",
+    "LtEq" => "GtEq"
+  }
 
   defp compare({:value, left}, op, {:value, right}), do: static_compare(left, op, right)
-  defp compare({:value, _} = value, op, {:field, _, _, _} = field), do: compare(field, Map.fetch!(@flip, op), value)
+
+  defp compare({:value, _} = value, op, {:field, _, _, _} = field),
+    do: compare(field, Map.fetch!(@flip, op), value)
 
   defp compare({:field, _, _, _}, _op, {:field, _, _, _}),
     do: unsupported("Comparing two fields is not supported")
@@ -758,17 +853,27 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor.Query do
   defp coerce(value, _cast), do: value
 
   defp field_compare(_field, _op, nil), do: false
-  defp field_compare(@timestamp_field = field, "Eq", value), do: range(field, %{"gte" => timestamp(value), "lte" => timestamp(value)})
+
+  defp field_compare(@timestamp_field = field, "Eq", value),
+    do: range(field, %{"gte" => timestamp(value), "lte" => timestamp(value)})
 
   defp field_compare(field, "Eq", value) when field in @text_fields and is_binary(value),
     do: %{"match_phrase" => %{field => %{"query" => value}}}
 
   defp field_compare(field, "Eq", value), do: term(field, value)
-  defp field_compare(field, "NotEq", value), do: all_of([exists(String.split(field, ".")), none_of(field_compare(field, "Eq", value))])
+
+  defp field_compare(field, "NotEq", value),
+    do: all_of([exists(String.split(field, ".")), none_of(field_compare(field, "Eq", value))])
+
   defp field_compare(field, "Gt", value), do: range(field, %{"gt" => range_value(field, value)})
-  defp field_compare(field, "GtEq", value), do: range(field, %{"gte" => range_value(field, value)})
+
+  defp field_compare(field, "GtEq", value),
+    do: range(field, %{"gte" => range_value(field, value)})
+
   defp field_compare(field, "Lt", value), do: range(field, %{"lt" => range_value(field, value)})
-  defp field_compare(field, "LtEq", value), do: range(field, %{"lte" => range_value(field, value)})
+
+  defp field_compare(field, "LtEq", value),
+    do: range(field, %{"lte" => range_value(field, value)})
 
   defp range_value(@timestamp_field, value), do: timestamp(value)
   defp range_value(_field, value), do: value
@@ -820,11 +925,22 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor.Query do
     core = pattern |> String.trim("%") |> String.replace(["%", "_"], " ") |> String.trim()
 
     cond do
-      core == "" -> exists(path)
-      not String.contains?(pattern, ["%", "_"]) -> field_compare(field, "Eq", pattern)
-      field in @text_fields -> phrase(field, core, :contains)
-      String.ends_with?(pattern, "%") and not String.starts_with?(pattern, "%") -> prefix(field, core)
-      true -> unsupported("LIKE with a leading wildcard is only supported on #{Enum.join(@text_fields, ", ")}")
+      core == "" ->
+        exists(path)
+
+      not String.contains?(pattern, ["%", "_"]) ->
+        field_compare(field, "Eq", pattern)
+
+      field in @text_fields ->
+        phrase(field, core, :contains)
+
+      String.ends_with?(pattern, "%") and not String.starts_with?(pattern, "%") ->
+        prefix(field, core)
+
+      true ->
+        unsupported(
+          "LIKE with a leading wildcard is only supported on #{Enum.join(@text_fields, ", ")}"
+        )
     end
   end
 
@@ -840,7 +956,11 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor.Query do
     |> String.replace(~r/^\(\?[a-z]+\)/, "")
     |> String.split("|")
     |> Enum.map(fn alternative ->
-      words = alternative |> String.replace(~r/\\[a-zA-Z]|[\^\$\.\*\+\?\(\)\[\]\{\}\\]/, " ") |> String.trim()
+      words =
+        alternative
+        |> String.replace(~r/\\[a-zA-Z]|[\^\$\.\*\+\?\(\)\[\]\{\}\\]/, " ")
+        |> String.trim()
+
       if words == "", do: true, else: phrase(field, words, :contains)
     end)
     |> any_of()
@@ -894,16 +1014,16 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor.Query do
       true in conditions -> true
       conditions == [] -> false
       match?([_], conditions) -> hd(conditions)
-      true -> %{"bool" => %{"should" => Enum.flat_map(conditions, &flatten(&1, "should")), "minimum_should_match" => 1}}
+      true -> %{"bool" => %{"should" => Enum.flat_map(conditions, &flatten(&1, "should"))}}
     end
   end
 
   # Merges nested bools of the same kind: (a AND b) AND c is one must list.
+  # A bool holding only `should` clauses matches when at least one of them does.
   defp flatten(%{"bool" => %{"must" => items} = bool}, "must") when map_size(bool) == 1, do: items
 
-  defp flatten(%{"bool" => %{"should" => items, "minimum_should_match" => 1} = bool}, "should")
-       when map_size(bool) == 2,
-       do: items
+  defp flatten(%{"bool" => %{"should" => items} = bool}, "should") when map_size(bool) == 1,
+    do: items
 
   defp flatten(query, _kind), do: [query]
 

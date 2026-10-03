@@ -4,7 +4,8 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptorTest do
   alias Logflare.Backends
   alias Logflare.Backends.Adaptor
   alias Logflare.Backends.Adaptor.HttpBased
-  alias Logflare.Backends.Adaptor.QuickwitAdaptor.Query
+  alias Logflare.Backends.Adaptor.QueryResult
+  alias Logflare.Backends.QueryError
   alias Logflare.Backends.SourceSup
   alias Logflare.SystemMetrics.AllLogsLogged
   alias Logflare.Tesla.MockAdapter
@@ -26,7 +27,9 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptorTest do
         config: @valid_config
       )
 
-    [backend: backend, source: source]
+    table = "`project.dataset.#{String.replace(to_string(source.token), "-", "_")}`"
+
+    [backend: backend, source: source, table: table]
   end
 
   setup do
@@ -64,35 +67,77 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptorTest do
     end
   end
 
-  describe "test_connection/1" do
+  describe "test_connection/1 and ensure_index/1" do
     setup :backend_data
 
-    test "succeeds on 200 response", ctx do
+    test "succeeds when the index exists", ctx do
       mock_adapter(fn env ->
         assert env.method == :get
-        assert env.url == "http://quickwit.local:7280/api/v1/logflare"
+        assert env.url == "http://quickwit.local:7280/api/v1/indexes/logflare"
 
-        {:ok, %Tesla.Env{status: 200, body: ~s({"index_id":"logflare"})}}
+        {:ok, %Tesla.Env{status: 200, body: %{"index_config" => %{"index_id" => "logflare"}}}}
       end)
 
       assert :ok = @subject.test_connection(ctx.backend)
     end
 
-    test "returns error when the index is missing", ctx do
-      mock_adapter(fn env ->
-        assert env.url == "http://quickwit.local:7280/api/v1/logflare"
-        {:ok, %Tesla.Env{status: 404, body: ~s({"message":"index not found"})}}
+    test "creates the index when it is missing", ctx do
+      this = self()
+
+      mock_adapter(fn
+        %{method: :get} ->
+          {:ok, %Tesla.Env{status: 404, body: %{"message" => "index `logflare` not found"}}}
+
+        %{method: :post} = env ->
+          assert env.url == "http://quickwit.local:7280/api/v1/indexes"
+          send(this, {:created, Jason.decode!(env.body)})
+          {:ok, %Tesla.Env{status: 200, body: %{}}}
       end)
 
-      assert {:error, reason} = @subject.test_connection(ctx.backend)
-      assert reason =~ "not found"
+      assert :ok = @subject.ensure_index(ctx.backend)
+
+      assert_receive {:created, %{"index_id" => "logflare", "doc_mapping" => mapping}}
+      assert mapping["mode"] == "dynamic"
+      assert mapping["timestamp_field"] == "timestamp"
+
+      assert %{"tokenizer" => "raw", "fast" => true} =
+               Enum.find(mapping["field_mappings"], &(&1["name"] == "lf_source"))
+    end
+
+    test "tolerates another pipeline creating the index first", ctx do
+      mock_adapter(fn
+        %{method: :get} ->
+          {:ok, %Tesla.Env{status: 404, body: %{"message" => "not found"}}}
+
+        %{method: :post} ->
+          {:ok, %Tesla.Env{status: 400, body: %{"message" => "index `logflare` already exists"}}}
+      end)
+
+      assert :ok = @subject.ensure_index(ctx.backend)
+    end
+
+    test "returns the error when the index cannot be created", ctx do
+      mock_adapter(fn
+        %{method: :get} ->
+          {:ok, %Tesla.Env{status: 404, body: %{"message" => "not found"}}}
+
+        %{method: :post} ->
+          {:ok, %Tesla.Env{status: 400, body: %{"message" => "invalid mapping"}}}
+      end)
+
+      assert {:error, "invalid mapping"} = @subject.test_connection(ctx.backend)
+    end
+
+    test "returns error when unauthorized", ctx do
+      mock_adapter(fn _env -> {:ok, %Tesla.Env{status: 401, body: "denied"}} end)
+
+      assert {:error, "Unauthorized" <> _} = @subject.test_connection(ctx.backend)
     end
 
     test "returns error on request failure", ctx do
       mock_adapter(fn _env -> {:error, :nxdomain} end)
 
-      assert {:error, reason} = @subject.test_connection(ctx.backend)
-      assert is_binary(reason)
+      assert {:error, "Request error: :nxdomain"} = @subject.test_connection(ctx.backend)
     end
   end
 
@@ -100,24 +145,22 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptorTest do
     setup :backend_data
 
     setup %{source: source} do
+      this = self()
+
+      mock_adapter(fn
+        %{method: :get} ->
+          {:ok, %Tesla.Env{status: 200, body: %{}}}
+
+        %{method: :post} = env ->
+          send(this, {:ingest, env})
+          {:ok, %Tesla.Env{status: 200, body: ~s({"num_docs_for_processing":1})}}
+      end)
+
       start_supervised!({SourceSup, source})
       :ok
     end
 
-    test "sends logs as NDJSON to the ingest API", %{source: source} do
-      this = self()
-      ref = make_ref()
-
-      mock_adapter(fn env ->
-        assert Tesla.build_url(env) == "http://quickwit.local:7280/api/v1/logflare/ingest"
-        assert env.method == :post
-        assert Tesla.get_header(env, "content-type") == "application/x-ndjson"
-        assert Tesla.get_header(env, "content-encoding") == "gzip"
-
-        send(this, {ref, env.body})
-        {:ok, %Tesla.Env{status: 200, body: ~s({"num_docs_processed":1})}}
-      end)
-
+    test "sends logs as NDJSON documents tagged with their source", %{source: source} do
       log_event =
         build(:log_event,
           source: source,
@@ -127,183 +170,250 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptorTest do
         )
 
       assert {:ok, _} = Backends.ingest_logs([log_event], source)
-      assert_receive {^ref, gzipped}, 5000
-      assert json = :zlib.gunzip(gzipped)
+      assert_receive {:ingest, env}, 5000
 
-      assert [log] =
-               json
+      assert Tesla.build_url(env) == "http://quickwit.local:7280/api/v1/logflare/ingest"
+      assert Tesla.get_header(env, "content-type") == "application/x-ndjson"
+      assert Tesla.get_header(env, "content-encoding") == "gzip"
+
+      assert [document] =
+               env.body
+               |> :zlib.gunzip()
                |> String.split("\n", trim: true)
                |> Enum.map(&Jason.decode!/1)
 
-      assert log["event_message"] == log_event.body["event_message"]
-      assert log["random_attribute"] == "nothing"
-      assert String.contains?(log["timestamp"], "T")
+      assert document["event_message"] == "Test log message"
+      assert document["random_attribute"] == "nothing"
+      assert document["timestamp"] == log_event.body["timestamp"]
+      assert document["lf_source"] == to_string(source.token)
     end
 
     test "sends multiple log events as separate NDJSON lines", %{source: source} do
-      this = self()
-      ref = make_ref()
-
-      mock_adapter(fn env ->
-        send(this, {ref, env.body})
-        {:ok, %Tesla.Env{status: 200, body: ~s({"num_docs_processed":3})}}
-      end)
-
       log_events =
-        build_list(3, :log_event,
-          source: source,
-          timestamp: System.system_time(:microsecond)
-        )
+        build_list(3, :log_event, source: source, timestamp: System.system_time(:microsecond))
 
       assert {:ok, _} = Backends.ingest_logs(log_events, source)
-      assert_receive {^ref, gzipped}, 5000
-      assert json = :zlib.gunzip(gzipped)
-      assert [_, _, _] = String.split(json, "\n", trim: true)
+      assert_receive {:ingest, env}, 5000
+      assert [_, _, _] = env.body |> :zlib.gunzip() |> String.split("\n", trim: true)
     end
   end
 
   describe "execute_query/3" do
     setup :backend_data
 
-    test "translates SQL to QuickwitQL and returns hit rows", ctx do
+    test "searches documents and projects the selected columns", ctx do
+      source_token = to_string(ctx.source.token)
+
       mock_adapter(fn env ->
         assert env.method == :post
-        assert Tesla.build_url(env) == "http://quickwit.local:7280/api/v1/logflare/search"
-        assert Tesla.get_header(env, "content-type") == "application/json"
+        assert env.url == "http://quickwit.local:7280/api/v1/_elastic/logflare/_search"
 
-        assert %{"query" => "level:\"error\"", "max_hits" => 100} =
-                 env.body |> IO.iodata_to_binary() |> Jason.decode!()
-
-        {:ok,
-         %Tesla.Env{
-           status: 200,
-           body: ~s({"hits":[{"level":"error","event_message":"boom"}],"num_hits":1})
-         }}
-      end)
-
-      assert {:ok, %Adaptor.QueryResult{rows: [row]}} =
-               @subject.execute_query(ctx.backend, "select * where level = 'error'", [])
-
-      assert row["level"] == "error"
-    end
-
-    test "applies LIMIT, ORDER BY and projections", ctx do
-      mock_adapter(fn env ->
         assert %{
-                 "query" => "level:\"error\" AND source:\"api\"",
-                 "max_hits" => 10,
-                 "sort_by" => "-timestamp"
-               } = env.body |> IO.iodata_to_binary() |> Jason.decode!()
+                 "size" => 2,
+                 "from" => 0,
+                 "sort" => [%{"timestamp" => %{"order" => "desc"}}],
+                 "query" => %{
+                   "bool" => %{
+                     "must" => [
+                       %{"term" => %{"lf_source" => %{"value" => ^source_token}}},
+                       %{"term" => %{"metadata.level" => %{"value" => "error"}}}
+                     ]
+                   }
+                 }
+               } = Jason.decode!(env.body)
+
+        hit = fn id, timestamp ->
+          %{
+            "_source" => %{
+              "id" => id,
+              "timestamp" => timestamp,
+              "event_message" => "boom",
+              "lf_source" => source_token,
+              "metadata" => %{"level" => "error"}
+            }
+          }
+        end
 
         {:ok,
          %Tesla.Env{
            status: 200,
-           body:
-             ~s({"hits":[{"level":"error","event_message":"boom","source":"api","timestamp":"2026-01-01T00:00:00Z"}],"num_hits":1})
+           body: %{
+             "hits" => %{
+               "hits" => [hit.("b", 1_790_000_060_000_000), hit.("a", 1_790_000_000_000_000)]
+             }
+           }
          }}
       end)
 
       sql = """
-      select event_message, level
-      where level = 'error' and source = 'api'
-      order by timestamp desc
-      limit 10
+      SELECT t.id, CAST(t.timestamp AS DATETIME) AS time, m.level AS level
+      FROM #{ctx.table} t CROSS JOIN UNNEST(t.metadata) AS m
+      WHERE m.level = @level
+      ORDER BY t.timestamp DESC
+      LIMIT 2
       """
 
-      assert {:ok, %Adaptor.QueryResult{rows: [row], total_rows: 1}} =
-               @subject.execute_query(ctx.backend, sql, [])
+      assert {:ok, %QueryResult{rows: rows, total_rows: 2}} =
+               @subject.execute_query(ctx.backend, {sql, [], %{"level" => "error"}}, [])
 
-      assert row == %{"event_message" => "boom", "level" => "error"}
+      assert rows == [
+               %{"id" => "b", "time" => "2026-09-21T14:14:20.000000Z", "level" => "error"},
+               %{"id" => "a", "time" => "2026-09-21T14:13:20.000000Z", "level" => "error"}
+             ]
     end
 
-    test "substitutes @params from input_params", ctx do
-      mock_adapter(fn env ->
-        assert %{"query" => "level:\"error\""} = env.body |> IO.iodata_to_binary() |> Jason.decode!()
-        {:ok, %Tesla.Env{status: 200, body: ~s({"hits":[],"num_hits":0})}}
+    test "SELECT * returns whole documents without the source tag", ctx do
+      mock_adapter(fn _env ->
+        {:ok,
+         %Tesla.Env{
+           status: 200,
+           body: %{"hits" => %{"hits" => [%{"_source" => %{"id" => "a", "lf_source" => "x"}}]}}
+         }}
       end)
 
-      assert {:ok, %Adaptor.QueryResult{rows: []}} =
-               @subject.execute_query(
-                 ctx.backend,
-                 {"select * where level = @lvl", %{"lvl" => "error"}},
-                 []
-               )
+      assert {:ok, %QueryResult{rows: [%{"id" => "a"}]}} =
+               @subject.execute_query(ctx.backend, "SELECT * FROM #{ctx.table}", [])
+    end
+
+    test "counts with one search per distinct filter", ctx do
+      mock_adapter(fn env ->
+        assert %{"size" => 0, "track_total_hits" => true, "query" => query} =
+                 Jason.decode!(env.body)
+
+        total = if match?(%{"term" => _}, query), do: 7, else: 3
+
+        {:ok,
+         %Tesla.Env{
+           status: 200,
+           body: %{"hits" => %{"total" => %{"value" => total}, "hits" => []}}
+         }}
+      end)
+
+      sql = """
+      SELECT count(*) AS total, count(CASE WHEN level = 'error' THEN 1 END) AS errors
+      FROM #{ctx.table}
+      """
+
+      assert {:ok, %QueryResult{rows: [%{"total" => 7, "errors" => 3}]}} =
+               @subject.execute_query(ctx.backend, {sql, [], %{}}, [])
+    end
+
+    test "builds time buckets from a date histogram", ctx do
+      mock_adapter(fn env ->
+        assert %{
+                 "size" => 0,
+                 "aggs" => %{
+                   "buckets" => %{
+                     "date_histogram" => %{"field" => "timestamp", "fixed_interval" => "1m"}
+                   }
+                 }
+               } = Jason.decode!(env.body)
+
+        buckets = [
+          %{"key" => 1_790_000_040_000.0, "doc_count" => 2},
+          %{"key" => 1_790_000_100_000.0, "doc_count" => 0},
+          %{"key" => 1_790_000_160_000.0, "doc_count" => 5}
+        ]
+
+        {:ok,
+         %Tesla.Env{
+           status: 200,
+           body: %{"aggregations" => %{"buckets" => %{"buckets" => buckets}}}
+         }}
+      end)
+
+      sql = """
+      SELECT timestamp_trunc(t.timestamp, minute) AS timestamp, count(t.timestamp) AS count
+      FROM #{ctx.table} t
+      GROUP BY timestamp
+      ORDER BY timestamp DESC
+      """
+
+      assert {:ok, %QueryResult{rows: rows}} =
+               @subject.execute_query(ctx.backend, {sql, [], %{}}, [])
+
+      assert rows == [
+               %{"timestamp" => 1_790_000_160_000_000, "count" => 5},
+               %{"timestamp" => 1_790_000_040_000_000, "count" => 2}
+             ]
+    end
+
+    test "counts per field value from a terms aggregation", ctx do
+      mock_adapter(fn env ->
+        assert %{"aggs" => %{"values" => %{"terms" => %{"field" => "level"}}}} =
+                 Jason.decode!(env.body)
+
+        buckets = [%{"key" => "error", "doc_count" => 4}, %{"key" => "info", "doc_count" => 9}]
+
+        {:ok,
+         %Tesla.Env{
+           status: 200,
+           body: %{"aggregations" => %{"values" => %{"buckets" => buckets}}}
+         }}
+      end)
+
+      sql = "SELECT level, count(*) AS count FROM #{ctx.table} GROUP BY level"
+
+      assert {:ok, %QueryResult{rows: rows}} =
+               @subject.execute_query(ctx.backend, {sql, [], %{}}, [])
+
+      assert Enum.sort_by(rows, & &1["level"]) == [
+               %{"level" => "error", "count" => 4},
+               %{"level" => "info", "count" => 9}
+             ]
     end
 
     test "returns invalid_query error for unsupported SQL", ctx do
-      assert {:error, %Logflare.Backends.QueryError{kind: :invalid_query}} =
-               @subject.execute_query(ctx.backend, "select count(*) from logs", [])
+      reject(HttpBased.Client, :new, 1)
+
+      assert {:error,
+              %QueryError{kind: :invalid_query, backend: @subject, description: description}} =
+               @subject.execute_query(ctx.backend, "SELECT sum(status) FROM #{ctx.table}", [])
+
+      assert description =~ "sum()"
     end
 
-    test "returns backend_error on HTTP failure", ctx do
+    test "returns backend_error on a failed search", ctx do
       mock_adapter(fn _env ->
-        {:ok, %Tesla.Env{status: 500, body: ~s({"message":"internal error"})}}
+        {:ok, %Tesla.Env{status: 400, body: %{"message" => "bad query"}}}
       end)
 
-      assert {:error, %Logflare.Backends.QueryError{kind: :backend_error}} =
-               @subject.execute_query(ctx.backend, "select * where level = 'error'", [])
+      assert {:error, %QueryError{kind: :backend_error, description: description}} =
+               @subject.execute_query(ctx.backend, "SELECT id FROM #{ctx.table}", [])
+
+      assert description =~ "status 400"
+    end
+
+    test "returns connection_error when Quickwit is unreachable", ctx do
+      mock_adapter(fn _env -> {:error, :econnrefused} end)
+
+      assert {:error, %QueryError{kind: :connection_error}} =
+               @subject.execute_query(ctx.backend, "SELECT id FROM #{ctx.table}", [])
     end
   end
 
   describe "sanitize_config_for_display/1" do
     test "masks api_key while preserving displayable keys" do
-      config = %{endpoint: "http://quickwit:7280", index_id: "logflare", api_key: "SECRET"}
+      config = Map.put(@valid_config, :api_key, "secret-key-123")
 
-      assert %{endpoint: "http://quickwit:7280", index_id: "logflare", api_key: "**********"} ==
+      assert %{endpoint: "http://quickwit.local:7280", index_id: "logflare", api_key: masked} =
                @subject.sanitize_config_for_display(config)
+
+      refute masked == "secret-key-123"
     end
   end
 
   describe "redact_config/1" do
     test "redacts API key" do
-      config = %{endpoint: "http://quickwit:7280", index_id: "logflare", api_key: "SECRET"}
-
-      assert %{api_key: "REDACTED"} = @subject.redact_config(config)
+      assert %{api_key: "REDACTED"} = @subject.redact_config(%{api_key: "secret-key-123"})
+      assert @subject.redact_config(@valid_config) == @valid_config
     end
   end
 
-  describe "Query.to_search/3" do
-    test "translates comparison operators" do
-      assert {:ok, {"level:\"error\"", _opts}} =
-               Query.to_search(:bq_sql, "select * where level = 'error'", %{})
-    end
-
-    test "translates NOT EQUAL" do
-      assert {:ok, {"NOT level:\"error\"", _opts}} =
-               Query.to_search(:bq_sql, "select * where level != 'error'", %{})
-    end
-
-    test "translates LIKE with wildcards" do
-      assert {:ok, {"event_message:*timed*", _opts}} =
-               Query.to_search(:bq_sql, "select * where event_message like '%timed%'", %{})
-    end
-
-    test "translates IN lists" do
-      assert {:ok, {"(level:\"error\" OR level:\"warn\")", _opts}} =
-               Query.to_search(:bq_sql, "select * where level in ('error', 'warn')", %{})
-    end
-
-    test "translates timestamp ranges" do
-      assert {:ok, {"timestamp:[1700000000000000 TO *]", _opts}} =
-               Query.to_search(:bq_sql, "select * where timestamp >= 1700000000000000", %{})
-    end
-
-    test "maps ORDER BY to sort_by and LIMIT to max_hits" do
-      assert {:ok, {"*", [max_hits: 25, fields: :all, sort_by: "-timestamp"]}} =
-               Query.to_search(:bq_sql, "select * order by timestamp desc limit 25", %{})
-    end
-
-    test "rejects unsupported SQL" do
-      assert {:error, reason} = Query.to_search(:bq_sql, "select count(*) from logs", %{})
-      assert is_binary(reason)
-    end
-  end
-
-  defp mock_adapter(calls_num \\ 1, function) do
+  defp mock_adapter(function) do
     stub(@tesla_adapter)
 
-    HttpBased.Client
-    |> expect(:new, calls_num, fn opts ->
+    stub(HttpBased.Client, :new, fn opts ->
       HttpBased.Client
       |> Mimic.call_original(:new, [opts])
       |> MockAdapter.replace(function)

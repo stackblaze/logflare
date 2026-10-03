@@ -82,7 +82,8 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor do
       message: "must be a valid http(s) URL, e.g. http://quickwit:7280"
     )
     |> Changeset.validate_format(:index_id, ~r/^[a-zA-Z][a-zA-Z0-9_\-]{2,254}$/,
-      message: "must start with a letter and contain only letters, digits, - and _ (3 to 255 characters)"
+      message:
+        "must start with a letter and contain only letters, digits, - and _ (3 to 255 characters)"
     )
   end
 
@@ -105,6 +106,8 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor do
       url: base_url(config) <> "#{@api_base}/#{config.index_id}/ingest",
       formatter: DocumentFormatter,
       json: false,
+      gzip: true,
+      http2: false,
       token: config[:api_key]
     ]
   end
@@ -127,7 +130,9 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor do
 
   defp create_index(config) do
     case Tesla.post(api_client(config), "/indexes", index_config(config.index_id)) do
-      {:ok, %Tesla.Env{status: 200}} -> :ok
+      {:ok, %Tesla.Env{status: 200}} ->
+        :ok
+
       # lost a race against another pipeline of the same backend
       {:ok, %Tesla.Env{status: 400, body: %{"message" => message}}} when is_binary(message) ->
         if message =~ "already exist", do: :ok, else: {:error, message}
@@ -239,25 +244,15 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor do
   end
 
   defp run(%{shape: :histogram} = plan, config) do
-    aggregation = %{@histogram => %{date_histogram: %{field: "timestamp", fixed_interval: plan.interval}}}
+    aggregation = %{
+      @histogram => %{date_histogram: %{field: "timestamp", fixed_interval: plan.interval}}
+    }
 
     with {:ok, results} <-
-           each_query([{plan.column, plan.query} | plan.counters], config, fn query ->
-             %{query: query, size: 0, aggs: aggregation}
-           end) do
-      counts = fn query ->
-        for %{"key" => key, "doc_count" => count} <- buckets(results[query], @histogram),
-            into: %{},
-            do: {trunc(key), count}
-      end
-
-      per_counter = Map.new(plan.counters, fn {name, query} -> {name, counts.(query)} end)
-
-      rows =
-        for {key, total} <- Enum.sort(counts.(plan.query)), total > 0 do
-          Map.new(plan.counters, fn {name, _query} -> {name, Map.get(per_counter[name], key, 0)} end)
-          |> Map.put(plan.column, key * 1_000)
-        end
+           aggregate([{plan.column, plan.query} | plan.counters], config, aggregation) do
+      counts = &bucket_counts(results[&1], @histogram, fn key -> trunc(key) end)
+      keys = for {key, total} <- Enum.sort(counts.(plan.query)), total > 0, do: key
+      rows = counter_rows(plan, counts, keys, &(&1 * 1_000))
 
       {:ok, if(plan.order == :desc, do: Enum.reverse(rows), else: rows)}
     end
@@ -266,26 +261,37 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor do
   defp run(%{shape: :terms} = plan, config) do
     aggregation = %{@terms => %{terms: %{field: plan.field, size: plan.size}}}
 
-    with {:ok, results} <-
-           each_query(plan.counters, config, fn query ->
-             %{query: query, size: 0, aggs: aggregation}
-           end) do
-      counts = fn query ->
-        for %{"key" => key, "doc_count" => count} <- buckets(results[query], @terms),
-            into: %{},
-            do: {key, count}
-      end
+    with {:ok, results} <- aggregate(plan.counters, config, aggregation) do
+      counts = &bucket_counts(results[&1], @terms, fn key -> key end)
 
-      per_counter = Map.new(plan.counters, fn {name, query} -> {name, counts.(query)} end)
-      keys = per_counter |> Map.values() |> Enum.flat_map(&Map.keys/1) |> Enum.uniq()
+      keys =
+        plan.counters
+        |> Enum.flat_map(fn {_name, query} -> Map.keys(counts.(query)) end)
+        |> Enum.uniq()
 
-      rows =
-        for key <- keys do
-          Map.new(plan.counters, fn {name, _query} -> {name, Map.get(per_counter[name], key, 0)} end)
-          |> Map.put(plan.column, key)
-        end
+      {:ok, counter_rows(plan, counts, keys, & &1)}
+    end
+  end
 
-      {:ok, rows}
+  defp aggregate(counters, config, aggregation) do
+    each_query(counters, config, &%{query: &1, size: 0, aggs: aggregation})
+  end
+
+  @spec bucket_counts(map() | nil, String.t(), (term() -> term())) :: %{term() => integer()}
+  defp bucket_counts(response, name, key_fun) do
+    for %{"key" => key, "doc_count" => count} <- buckets(response, name),
+        into: %{},
+        do: {key_fun.(key), count}
+  end
+
+  # One row per bucket key: the key under the plan's column, plus every counter's count for it.
+  defp counter_rows(plan, counts, keys, value_fun) do
+    per_counter = Enum.map(plan.counters, fn {name, query} -> {name, counts.(query)} end)
+
+    for key <- keys do
+      per_counter
+      |> Map.new(fn {name, by_key} -> {name, Map.get(by_key, key, 0)} end)
+      |> Map.put(plan.column, value_fun.(key))
     end
   end
 
@@ -317,7 +323,11 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor do
         {:ok, response}
 
       {:ok, %Tesla.Env{status: status, body: response}} ->
-        {:error, query_error(:backend_error, "Quickwit search failed with status #{status}: #{inspect(response)}")}
+        {:error,
+         query_error(
+           :backend_error,
+           "Quickwit search failed with status #{status}: #{inspect(response)}"
+         )}
 
       {:error, reason} ->
         {:error, query_error(:connection_error, "Request error: #{inspect(reason)}")}
@@ -339,7 +349,12 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor do
   defp to_datetime(other), do: other
 
   defp api_client(config) do
-    HttpBased.Client.new(url: base_url(config) <> @api_base, token: config[:api_key], json: true)
+    HttpBased.Client.new(
+      url: base_url(config) <> @api_base,
+      token: config[:api_key],
+      json: true,
+      http2: false
+    )
   end
 
   defp base_url(config), do: String.trim_trailing(config.endpoint, "/")
@@ -350,7 +365,12 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor do
   end
 
   defp log_query_error({:error, %QueryError{} = error} = result, %Backend{} = backend) do
-    QueryError.log(error, user_id: backend.user_id, backend_id: backend.id, backend_token: backend.token)
+    QueryError.log(error,
+      user_id: backend.user_id,
+      backend_id: backend.id,
+      backend_token: backend.token
+    )
+
     result
   end
 
