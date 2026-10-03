@@ -17,7 +17,6 @@ defmodule Logflare.Backends.Adaptor.HttpBased.NdjsonFormatter do
   @impl Tesla.Middleware
   def call(env, next, opts) do
     metadata = Keyword.get(opts || [], :metadata, [])
-    content_type = Keyword.get(opts || [], :content_type, @content_type)
 
     case encode(env.body, metadata) do
       [] when env.body != [] ->
@@ -25,7 +24,7 @@ defmodule Logflare.Backends.Adaptor.HttpBased.NdjsonFormatter do
 
       body ->
         env
-        |> put_content_type_header(content_type)
+        |> put_content_type_header()
         |> Tesla.put_body(body)
         |> Tesla.run(next)
     end
@@ -42,9 +41,9 @@ defmodule Logflare.Backends.Adaptor.HttpBased.NdjsonFormatter do
   # Strips any pre-existing content-type header case-insensitively before setting ours,
   # since Tesla.put_header/3 matches keys case-sensitively and would otherwise leave a
   # user-configured "Content-Type" header alongside this one.
-  defp put_content_type_header(env, content_type) do
+  defp put_content_type_header(env) do
     headers = Enum.reject(env.headers, fn {k, _v} -> String.downcase(k) == "content-type" end)
-    Tesla.put_header(%{env | headers: headers}, "content-type", content_type)
+    Tesla.put_header(%{env | headers: headers}, "content-type", @content_type)
   end
 
   @doc """
