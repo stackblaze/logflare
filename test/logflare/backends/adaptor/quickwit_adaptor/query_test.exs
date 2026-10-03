@@ -93,6 +93,33 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor.QueryTest do
     end
   end
 
+  describe "unqualified columns" do
+    test "resolve to the unnested record that owns them" do
+      plan =
+        plan!("""
+        SELECT id, path, function_id
+        FROM #{@table} t CROSS JOIN UNNEST(t.metadata) AS m CROSS JOIN UNNEST(m.request) AS request
+        WHERE status_code >= 500
+        """)
+
+      assert plan.columns == [
+               {"id", {:path, ["id"]}},
+               {"path", {:path, ["metadata", "request", "path"]}},
+               {"function_id", {:path, ["metadata", "function_id"]}}
+             ]
+
+      assert plan.query == %{
+               "bool" => %{
+                 "must" => [@source, %{"range" => %{"metadata.status_code" => %{"gte" => 500}}}]
+               }
+             }
+    end
+
+    test "stay top-level without an UNNEST" do
+      assert filters("level = 'error'") == [term("level", "error")]
+    end
+  end
+
   describe "conditions" do
     test "comparisons" do
       assert filters("level = 'error' AND status >= 500") == [

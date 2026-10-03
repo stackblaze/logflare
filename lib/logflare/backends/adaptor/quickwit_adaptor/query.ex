@@ -48,6 +48,11 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor.Query do
   @source_field "lf_source"
   @timestamp_field "timestamp"
   @text_fields ["event_message"]
+  @event_columns ~w(timestamp id event_message metadata project identifier)
+  @record_fields %{
+    "request" => ~w(path method search host protocol url headers cf),
+    "response" => ~w(status_code origin_time headers)
+  }
   @dialects %{bq_sql: "bigquery", ch_sql: "clickhouse", pg_sql: "postgres"}
   @intervals %{
     "second" => "1s",
@@ -260,8 +265,22 @@ defmodule Logflare.Backends.Adaptor.QuickwitAdaptor.Query do
     cond do
       path = scope.unnests[first] -> path ++ rest
       rest != [] and MapSet.member?(scope.tables, first) -> rest
+      rest == [] -> unqualified(first, scope)
       true -> segments
     end
+  end
+
+  # A bare column that is not an event column belongs to one of the unnested records, as in
+  # BigQuery: `path` after `CROSS JOIN UNNEST(m.request)` is `metadata.request.path`. Without
+  # a schema, the record is picked by its usual fields, else the outermost one (`metadata`).
+  defp unqualified(name, scope) do
+    paths = scope.unnests |> Map.values() |> Enum.sort_by(&length/1)
+
+    owner =
+      Enum.find(paths, fn path -> name in Map.get(@record_fields, List.last(path), []) end) ||
+        List.first(paths)
+
+    if name in @event_columns or is_nil(owner), do: [name], else: owner ++ [name]
   end
 
   ## Result shape
