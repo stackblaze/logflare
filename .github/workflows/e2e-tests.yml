@@ -32,7 +32,7 @@ concurrency:
 jobs:
   versions:
     name: Get versions
-    runs-on: [self-hosted, us-east-1]
+    runs-on: ubuntu-latest
     outputs:
       elixir: ${{ steps.v.outputs.elixir }}
       erlang: ${{ steps.v.outputs.erlang }}
@@ -48,7 +48,7 @@ jobs:
 
   test:
     name: Tests with Playwright
-    runs-on: [self-hosted, us-east-1]
+    runs-on: ubuntu-latest
     timeout-minutes: 25
     needs: versions
 
