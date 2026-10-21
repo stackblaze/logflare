@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   retag:
-    runs-on: [self-hosted, us-east-1]
+    runs-on: ubuntu-latest
     outputs:
       docker_tag: ${{ steps.docker-image.outputs.tag }}
     steps:
@@ -42,7 +42,7 @@ jobs:
     secrets: inherit
 
   mirror_image:
-    runs-on: [self-hosted, us-east-1]
+    runs-on: ubuntu-latest
     needs:
       - retag
     permissions:

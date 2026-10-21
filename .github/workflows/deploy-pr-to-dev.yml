@@ -24,7 +24,7 @@ permissions:
 # dev-<sha> tags docker-ci-amd-and-arm.yml produces for main.
 jobs:
   settings:
-    runs-on: [self-hosted, us-east-1]
+    runs-on: ubuntu-latest
     outputs:
       short_sha: ${{ steps.env.outputs.short_sha }}
       pr_number: ${{ steps.pr.outputs.number }}
@@ -45,7 +45,7 @@ jobs:
 
   build:
     needs: settings
-    runs-on: [self-hosted, us-east-1]
+    runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v3
@@ -72,7 +72,7 @@ jobs:
     needs:
       - settings
       - build
-    runs-on: [self-hosted, us-east-1]
+    runs-on: ubuntu-latest
     steps:
       - uses: docker/login-action@v2
         with:
@@ -88,7 +88,7 @@ jobs:
     needs:
       - settings
       - merge_publish
-    runs-on: [self-hosted, us-east-1]
+    runs-on: ubuntu-latest
     concurrency:
       # Different dev numbers deploy independently; same dev number serializes.
       group: deploy-pr-to-dev-${{ inputs.dev_number }}
